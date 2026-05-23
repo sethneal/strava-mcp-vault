@@ -776,7 +776,13 @@ def _stream_unit(stream_type: str) -> str:
 
 
 def format_athlete_profile(profile: dict) -> str:
-    """Format athlete profile as markdown."""
+    """Format athlete profile as markdown.
+
+    Renders SummaryAthlete fields always (name, location, premium) and
+    DetailedAthlete fields (weight, ftp, measurement_preference, bikes,
+    shoes) only when present — those require the profile:read_all OAuth
+    scope on the access token.
+    """
     first = profile.get("firstname", "")
     last = profile.get("lastname", "")
     city = profile.get("city", "")
@@ -798,6 +804,13 @@ def format_athlete_profile(profile: dict) -> str:
     if ftp:
         lines.append(f"- **FTP:** {ftp} W")
 
+    measurement_preference = profile.get("measurement_preference")
+    if measurement_preference:
+        unit_label = (
+            "imperial (feet)" if measurement_preference == "feet" else "metric (meters)"
+        )
+        lines.append(f"- **Units:** {unit_label}")
+
     follower_count = profile.get("follower_count")
     friend_count = profile.get("friend_count")
     if follower_count is not None or friend_count is not None:
@@ -806,6 +819,28 @@ def format_athlete_profile(profile: dict) -> str:
     premium = profile.get("premium") or profile.get("summit")
     if premium:
         lines.append("- **Strava Summit:** Active")
+
+    bikes = profile.get("bikes") or []
+    if bikes:
+        lines.append("\n**Bikes:**")
+        for bike in bikes:
+            primary = " (primary)" if bike.get("primary") else ""
+            distance_km = (bike.get("distance") or 0) / 1000
+            lines.append(
+                f"- {bike.get('name', '?')}{primary} — `{bike.get('id', '?')}` "
+                f"({distance_km:,.0f} km lifetime)"
+            )
+
+    shoes = profile.get("shoes") or []
+    if shoes:
+        lines.append("\n**Shoes:**")
+        for shoe in shoes:
+            primary = " (primary)" if shoe.get("primary") else ""
+            distance_km = (shoe.get("distance") or 0) / 1000
+            lines.append(
+                f"- {shoe.get('name', '?')}{primary} — `{shoe.get('id', '?')}` "
+                f"({distance_km:,.0f} km lifetime)"
+            )
 
     lines.append(f"\n*Athlete ID: {profile.get('id')}*")
 

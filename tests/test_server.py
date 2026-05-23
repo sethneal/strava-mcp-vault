@@ -204,6 +204,57 @@ def test_format_error_401_without_scope_hint_says_reseed():
     assert "reseed" in msg.lower() or "re-seed" in msg.lower()
 
 
+def test_format_error_401_profile_scope_marker_says_profile_read_all():
+    """When 401 detail mentions profile:read_permission, recommend profile:read_all OAuth."""
+    from strava_mcp_vault.exceptions import StravaAPIError
+    from strava_mcp_vault.server import _tool_error
+
+    err = StravaAPIError(
+        status_code=401,
+        path="/athlete/zones",
+        detail='{"message":"Authorization Error","errors":[{"resource":"AccessToken","field":"profile:read_permission","code":"missing"}]}',
+    )
+    msg = _tool_error("strava_get_zone_distribution", err)
+
+    assert "scope" in msg.lower()
+    assert "profile:read_all" in msg
+    assert "reseed" not in msg.lower()
+
+
+def test_format_error_401_zones_path_says_profile_read_all_even_without_marker():
+    """A 401 on /athlete/zones with no body almost always means missing profile:read_all."""
+    from strava_mcp_vault.exceptions import StravaAPIError
+    from strava_mcp_vault.server import _tool_error
+
+    err = StravaAPIError(
+        status_code=401,
+        path="/athlete/zones",
+        detail="",
+    )
+    msg = _tool_error("strava_get_zone_distribution", err)
+
+    assert "profile:read_all" in msg
+    assert "reseed" not in msg.lower()
+
+
+def test_format_error_401_activity_scope_marker_still_says_activity_read_all():
+    """Regression: activity:read_permission detection still wins over path-based heuristics."""
+    from strava_mcp_vault.exceptions import StravaAPIError
+    from strava_mcp_vault.server import _tool_error
+
+    err = StravaAPIError(
+        status_code=401,
+        path="/athlete/zones",
+        detail='{"errors":[{"field":"activity:read_permission","code":"missing"}]}',
+    )
+    msg = _tool_error("strava_get_zone_distribution", err)
+
+    # Should identify the missing scope as activity (the diagnosed problem),
+    # not pivot to profile because of the path. The recommended re-OAuth
+    # scope string may include profile:read_all for completeness.
+    assert "missing 'activity:read_all'" in msg
+
+
 # ── get_activity_streams: defensive filter + downsample ───────────────
 
 
@@ -466,3 +517,136 @@ async def test_get_cardiac_drift_tool():
     assert payload["activity_id"] == 1
     assert payload["first_half"]["avg_hr"] == 130.0
     assert payload["second_half"]["avg_hr"] == 150.0
+
+
+# ── _with_timeout decorator ────────────────────────────────────────────
+
+
+async def test_with_timeout_passes_through_normal_return():
+    import asyncio as _asyncio  # noqa: F401
+    from strava_mcp_vault.server import _with_timeout
+
+    @_with_timeout(1)
+    async def fast():
+        return "ok"
+
+    assert await fast() == "ok"
+
+
+async def test_with_timeout_returns_error_string_on_timeout():
+    import asyncio as _asyncio
+    from strava_mcp_vault.server import _with_timeout
+
+    @_with_timeout(0.05)
+    async def slow():
+        await _asyncio.sleep(1)
+
+    result = await slow()
+    assert "timed out" in result.lower()
+    assert "health_check" in result.lower() or "restart" in result.lower()
+
+
+def test_with_timeout_preserves_signature_for_fastmcp():
+    """FastMCP introspects parameters — the wrapper must expose the original signature."""
+    import inspect
+
+    from strava_mcp_vault.server import _with_timeout
+
+    @_with_timeout(1)
+    async def example(activity_id: int, response_format: str = "markdown") -> str:
+        return ""
+
+    sig = inspect.signature(example)
+    assert "activity_id" in sig.parameters
+    assert "response_format" in sig.parameters
+    assert sig.parameters["activity_id"].annotation is int
+
+
+# ── strava_health_check ────────────────────────────────────────────────
+
+
+async def test_health_check_healthy():
+    """All probes succeed -> status=healthy in both markdown and json output."""
+    import time
+
+    m = AsyncMock()
+    m.db = AsyncMock()
+    m.db.ping = AsyncMock(return_value=None)
+    m.client = AsyncMock()
+    m.client._ensure_valid_token = AsyncMock(return_value=None)
+    m.client._expires_at = int(time.time()) + 3600
+    m.client.rate_limit_remaining = {
+        "short": {"usage": 5, "limit": 100},
+        "long": {"usage": 32, "limit": 1000},
+    }
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import health_check
+        result = await health_check(response_format="json")
+    payload = json.loads(result)
+    assert payload["status"] == "healthy"
+    assert payload["auth"]["ok"] is True
+    assert payload["db"]["ok"] is True
+    assert payload["token_expires_in_seconds"] > 3500
+
+
+async def test_health_check_auth_failure():
+    """Auth probe failure -> status=degraded, db still reports its own state."""
+    from strava_mcp_vault.exceptions import StravaAPIError
+
+    m = AsyncMock()
+    m.db = AsyncMock()
+    m.db.ping = AsyncMock(return_value=None)
+    m.client = AsyncMock()
+    m.client._ensure_valid_token = AsyncMock(
+        side_effect=StravaAPIError(status_code=401, path="/oauth/token", detail="")
+    )
+    m.client._expires_at = 0
+    m.client.rate_limit_remaining = None
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import health_check
+        result = await health_check(response_format="json")
+    payload = json.loads(result)
+    assert payload["status"] == "degraded"
+    assert payload["auth"]["ok"] is False
+    assert "401" in payload["auth"]["error"] or "unauthorized" in payload["auth"]["error"].lower()
+    assert payload["db"]["ok"] is True
+
+
+async def test_health_check_db_failure():
+    """DB probe failure -> status=degraded."""
+    import time
+
+    m = AsyncMock()
+    m.db = AsyncMock()
+    m.db.ping = AsyncMock(side_effect=RuntimeError("database is locked"))
+    m.client = AsyncMock()
+    m.client._ensure_valid_token = AsyncMock(return_value=None)
+    m.client._expires_at = int(time.time()) + 3600
+    m.client.rate_limit_remaining = None
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import health_check
+        result = await health_check(response_format="json")
+    payload = json.loads(result)
+    assert payload["status"] == "degraded"
+    assert payload["db"]["ok"] is False
+    assert "locked" in payload["db"]["error"]
+
+
+async def test_health_check_markdown_output():
+    """Markdown format renders human-readable status."""
+    import time
+
+    m = AsyncMock()
+    m.db = AsyncMock()
+    m.db.ping = AsyncMock(return_value=None)
+    m.client = AsyncMock()
+    m.client._ensure_valid_token = AsyncMock(return_value=None)
+    m.client._expires_at = int(time.time()) + 3600
+    m.client.rate_limit_remaining = None
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import health_check
+        result = await health_check(response_format="markdown")
+    assert "Health Check" in result
+    assert "healthy" in result.lower()
+    assert "Auth" in result
+    assert "Database" in result

@@ -553,6 +553,10 @@ class CacheDB:
             "mode": row[2],
         }
 
+    async def ping(self) -> None:
+        """Cheap connectivity probe — raises on failure, returns None on success."""
+        await self._db.execute("SELECT 1")
+
     async def close(self):
         if self._db:
             await self._db.close()
