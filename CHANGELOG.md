@@ -57,6 +57,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`strava_get_activity_streams` markdown mode** now includes a downsample banner (when applicable) and an inline preview of up to 60 evenly-spaced points per stream, in addition to the existing min/max/avg summary.
 
 ### Fixed
+- **Derived-metric tools now report what streams are actually available** when
+  the requested ones aren't present. Previously, `strava_get_power_curve`,
+  `strava_get_cardiac_drift`, etc. returned an ambiguous "No power data" /
+  "Missing required stream" message when Strava returned 200 OK with a
+  stream set that didn't include the one the tool needed (e.g. asking for
+  watts on an activity that only has distance). Same surface message for
+  three distinct states — "activity exists but no power", "activity exists
+  with different streams", "activity ID is wrong" — made debugging
+  guesswork. `CacheManager.get_streams_normalized` now raises a structured
+  `NoMatchingStreamsError(activity_id, requested, available)` whose string
+  form lists both the requested and actually-returned stream types, so
+  callers (and the agent driving the tools) can immediately see e.g.
+  `Activity 14583851847: requested [watts] not available. Available streams:
+  [distance].` and know whether to fix the ID, accept the limitation, or
+  pick a different metric.
 - **`query_vault` and `get_recent_activities` now use the same data source.**
   When the vault was empty, `get_recent_activities` returned live API
   results while `query_vault` silently reported zero rows — callers asking

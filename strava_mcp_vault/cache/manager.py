@@ -16,6 +16,8 @@ import logging
 import time
 from datetime import datetime
 
+from strava_mcp_vault.exceptions import NoMatchingStreamsError
+
 METERS_PER_MILE = 1609.344
 
 logger = logging.getLogger(__name__)
@@ -491,9 +493,24 @@ class CacheManager:
 
         Filters defensively to only the requested stream types — addresses
         Strava returning extra paired streams (e.g. distance with key_type=time).
+
+        Raises NoMatchingStreamsError when the filtered result is empty, so
+        callers can distinguish "this activity lacks the requested streams"
+        from "the activity ID is wrong or inaccessible". The error message
+        includes the list of stream types Strava actually returned.
         """
         raw = await self.get_activity_streams(activity_id, stream_types)
         requested = {t.strip() for t in stream_types.split(",")}
+
+        # Inventory ALL stream types Strava returned, before filtering. Used
+        # to produce a useful error message when the filtered result is empty.
+        available: set[str] = set()
+        if isinstance(raw, list):
+            for s in raw:
+                if isinstance(s, dict) and "type" in s:
+                    available.add(s["type"])
+        elif isinstance(raw, dict):
+            available = set(raw.keys())
 
         out: dict[str, list] = {}
         if isinstance(raw, list):
@@ -508,6 +525,10 @@ class CacheManager:
                     out[k] = v["data"]
                 elif isinstance(v, list):
                     out[k] = v
+
+        if not out:
+            raise NoMatchingStreamsError(activity_id, requested, available)
+
         return out
 
     async def get_cache_stats(self) -> dict:

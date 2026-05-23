@@ -1,5 +1,7 @@
 """Tests for cache/manager.py."""
 
+import pytest
+
 from strava_mcp_vault.cache.manager import _format_duration, _shape_activity
 
 # ── Helper functions ───────────────────────────────────────────────────
@@ -238,3 +240,41 @@ async def test_get_streams_normalized_filters_to_requested(cache_manager):
     result = await cache_manager.get_streams_normalized(123, "heartrate")
     assert "distance" not in result
     assert result == {"heartrate": [120, 130]}
+
+
+async def test_get_streams_normalized_raises_when_requested_absent(cache_manager):
+    """Regression: requested stream not in Strava response → structured error
+    with the list of streams Strava actually returned.
+
+    This was the Chat-reported bug: asking for watts on activity 14583851847
+    silently returned 'no power data' because Strava 200'd with a distance
+    stream we then filtered out — leaving the agent unable to tell whether the
+    activity had no power or whether the ID was wrong entirely.
+    """
+    from strava_mcp_vault.exceptions import NoMatchingStreamsError
+
+    cache_manager.client.get_activity_streams.return_value = [
+        {"type": "distance", "data": [0, 5.0]},  # Strava returned this
+    ]
+    with pytest.raises(NoMatchingStreamsError) as exc_info:
+        await cache_manager.get_streams_normalized(14583851847, "watts")
+
+    err = exc_info.value
+    assert err.activity_id == 14583851847
+    assert err.requested == ["watts"]
+    assert err.available == ["distance"]
+    assert "watts" in str(err)
+    assert "distance" in str(err)
+
+
+async def test_get_streams_normalized_raises_when_strava_returns_nothing(cache_manager):
+    """Empty Strava response → error reports empty available list."""
+    from strava_mcp_vault.exceptions import NoMatchingStreamsError
+
+    cache_manager.client.get_activity_streams.return_value = []
+    with pytest.raises(NoMatchingStreamsError) as exc_info:
+        await cache_manager.get_streams_normalized(999, "watts,heartrate")
+
+    err = exc_info.value
+    assert err.available == []
+    assert "(none)" in str(err)
