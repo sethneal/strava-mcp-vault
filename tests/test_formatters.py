@@ -295,6 +295,45 @@ def test_format_athlete_profile():
     assert "250" in result
 
 
+def test_format_athlete_profile_with_detailed_fields():
+    """DetailedAthlete (profile:read_all scope) includes units, bikes, shoes."""
+    profile = {
+        "id": 12345,
+        "firstname": "Pete",
+        "lastname": "Test",
+        "weight": 80.0,
+        "ftp": 250,
+        "measurement_preference": "feet",
+        "bikes": [
+            {"id": "b1", "name": "Niner RLT", "primary": True, "distance": 4500000.0},
+            {"id": "b2", "name": "Old Trek", "primary": False, "distance": 1200000.0},
+        ],
+        "shoes": [
+            {"id": "s1", "name": "Hoka Clifton", "primary": True, "distance": 800000.0},
+        ],
+    }
+    result = format_athlete_profile(profile)
+    assert "Niner RLT" in result
+    assert "b1" in result
+    assert "Old Trek" in result
+    assert "Hoka Clifton" in result
+    assert "feet" in result.lower() or "imperial" in result.lower()
+
+
+def test_format_athlete_profile_no_gear_when_empty():
+    """Empty bikes/shoes lists shouldn't render empty gear sections."""
+    profile = {
+        "id": 12345,
+        "firstname": "Pete",
+        "lastname": "Test",
+        "bikes": [],
+        "shoes": [],
+    }
+    result = format_athlete_profile(profile)
+    assert "Bikes" not in result
+    assert "Shoes" not in result
+
+
 # ── format_athlete_stats ──────────────────────────────────────────────
 
 

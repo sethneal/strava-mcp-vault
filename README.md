@@ -71,6 +71,7 @@ For a simpler setup that just wraps the existing npm package in Docker, see [str
 | `strava_get_power_curve` | Best mean-max power at standard durations (5s, 30s, 1m, 5m, 20m, 1h, ...). Foundation for fitness comparison. | 24 hours |
 | `strava_get_cardiac_drift` | First-half vs second-half HR comparison, with optional Pa:HR decoupling when power is present. Requires ≥20 min activity. | 24 hours |
 | `strava_get_hr_power_decoupling` | Pa:HR decoupling ratio between two segments. Requires both heartrate and watts streams. | 24 hours |
+| `strava_health_check` | Fast (<5s) probe of auth + DB. Returns per-probe ok/error, token TTL, and Strava rate-limit headroom. Use to detect a hung server before queuing real work. | — |
 
 All read tools accept a `response_format` parameter: `"markdown"` (default) for human-readable output or `"json"` for programmatic use.
 
@@ -81,6 +82,8 @@ All read tools accept a `response_format` parameter: `"markdown"` (default) for 
 - **A single Strava type:** `"Ride"`, `"GravelRide"`, `"Run"` — matched literally.
 - **A comma-separated list:** `"Ride,GravelRide,MountainBikeRide"`.
 - **A lowercase category alias:** `"rides"` / `"cycling"` (all ride types), `"running"`, `"swims"`, `"walks"`, `"hikes"`, `"snow"`, `"ski"`. Aliases are case-sensitive on the lowercase form — CamelCase always stays literal.
+
+> **Known limit: surface type.** Strava's `sport_type` only distinguishes `Ride` / `GravelRide` / `MountainBikeRide` / `VirtualRide`, and Strava itself only records surface when the user manually tags an upload as `GravelRide`. If you ride a single bike on both pavement and dirt, every ride comes back as `Ride` with no surface info, so questions like "how much of my volume is road vs gravel?" can't be answered from `sport_type` alone. Workarounds: tag gravel rides on Strava, or maintain a personal gear-id → surface mapping client-side.
 
 ## Working with stream data
 
@@ -174,10 +177,10 @@ This is the trickiest part, and Strava's docs don't make it easy. Here's what ac
 
 **Step 1: Build the authorization URL**
 
-> **CRITICAL: You MUST include `activity:read_all` in the scope parameter.** The default `read` scope only gives profile access. Without `activity:read_all`, every activity request returns a 401 with `"field": "activity:read_permission", "code": "missing"`. This is the #1 gotcha and it's poorly documented.
+> **CRITICAL: You MUST include `activity:read_all` AND `profile:read_all` in the scope parameter.** The default `read` scope only gives a sparse summary profile. Without `activity:read_all`, every activity request returns a 401 with `"field": "activity:read_permission", "code": "missing"`. Without `profile:read_all`, `strava_get_zone_distribution` returns 401 on `/athlete/zones` and `strava_get_athlete_profile` is missing FTP, weight, gear (bikes/shoes), and measurement preference. These are the #1 and #2 gotchas and Strava's docs barely mention them.
 
 ```
-https://www.strava.com/oauth/authorize?client_id=YOUR_CLIENT_ID&redirect_uri=https://YOUR_DOMAIN&response_type=code&scope=read,activity:read_all
+https://www.strava.com/oauth/authorize?client_id=YOUR_CLIENT_ID&redirect_uri=https://YOUR_DOMAIN&response_type=code&scope=read,activity:read_all,profile:read_all
 ```
 
 Replace `YOUR_CLIENT_ID` with the Client ID from your app settings, and `YOUR_DOMAIN` with the callback domain you entered when creating the app.
@@ -191,10 +194,10 @@ Open that URL in your browser. Authorize the app. Strava will redirect to your c
 After the redirect, your browser URL will look something like:
 
 ```
-https://yourdomain.com/?state=&code=abc123def456ghi789&scope=read,activity:read_all
+https://yourdomain.com/?state=&code=abc123def456ghi789&scope=read,activity:read_all,profile:read_all
 ```
 
-Copy the value between `code=` and `&scope` (in this example, `abc123def456ghi789`). That's your one-time authorization code for the next step.
+Copy the value between `code=` and `&scope` (in this example, `abc123def456ghi789`). That's your one-time authorization code for the next step. If the URL shows only `scope=read` (or is missing `profile:read_all`), the wrong scope was sent — start over with the URL above.
 
 **Step 3: Exchange the code for tokens**
 
@@ -378,13 +381,17 @@ Requires Python 3.10+ (3.13 used in CI).
 
 ## Troubleshooting
 
-**401 Authorization Error**: Wrong OAuth scopes. You need `activity:read_all`, not just `read`. See [OAuth: Get your access tokens](#oauth-get-your-access-tokens).
+**401 Authorization Error on `/athlete/activities`**: Token is missing `activity:read_all`. Re-run OAuth with `scope=read,activity:read_all,profile:read_all`. See [OAuth: Get your access tokens](#oauth-get-your-access-tokens).
+
+**401 Authorization Error on `/athlete/zones` (or sparse `strava_get_athlete_profile` output)**: Token is missing `profile:read_all`. The error tools surface this with a "missing 'profile:read_all'" hint. Re-run OAuth with the full scope above. Without `profile:read_all` the profile endpoint returns only name/id/premium — FTP, weight, gear, and measurement preference are not exposed.
 
 **429 Rate Limit**: Strava caps at 100 requests per 15 minutes, 1,000 per day. Wait and retry. Use `sync_activities` to bulk-cache data and reduce future API calls.
 
 **Container keeps restarting**: Check logs with `docker logs strava-mcp-vault`. Usually a missing or invalid `.env` variable.
 
 **Token expired**: The server refreshes tokens automatically before they expire. If refresh fails (revoked app, changed password), re-run the OAuth flow and update your `.env` with fresh tokens.
+
+**Tool call hangs or times out**: Each tool has a per-call timeout budget (10s for `health_check`/`get_cache_stats`, 60–90s for most, 300s for `sync_activities`). If a tool returns a `timed out after Ns` message, run `strava_health_check` to probe auth + DB health. If it also fails, restart the server.
 
 ## Strava attribution
 

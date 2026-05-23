@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `strava_get_activity_streams`: `export_path` parameter to write the full dataset to disk and return a small pointer (bypasses the size cap).
 - Pre-flight size guard on `strava_get_activity_streams`: when response would exceed ~800 KB and neither `max_points` nor `export_path` is set, returns a structured error with a recommended `max_points` value.
 - Defensive stream-type filter in `CacheManager.get_streams_normalized`: even if Strava returns extra paired streams, only requested types are surfaced.
+- **`strava_health_check` tool** — fast (<5s) probe of Strava auth + local DB connectivity. Reports per-probe ok/error, current access-token TTL, and Strava rate-limit headroom. Use to detect a hung or misconfigured server before queuing real tool calls.
+- **`strava_get_athlete_profile` now surfaces `measurement_preference`, `bikes`, and `shoes`** when present in the `/athlete` payload. Requires the `profile:read_all` OAuth scope; without it, Strava returns only the summary fields (name, premium, id).
+- **Per-tool timeout budget** (10–300s depending on tool) wrapping every MCP tool body. Silent hangs (stuck upstream Strava call, DB lock, async deadlock) now surface as a clear "timed out after Ns" error pointing at `strava_health_check` instead of letting the client wait minutes for its own timeout.
 
 ### Changed
 - **Database migration:** `activities` table grows five denormalized columns
@@ -49,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required.
 - 401 responses from Strava are now classified by cause: missing `activity:read_all`
   scope vs. expired/revoked tokens, with actionable recovery guidance per case.
+- 401 detection extended to cover the `profile:read_all` scope. A 401 on
+  `/athlete/zones` (or any 401 whose body mentions `profile:read_permission`)
+  now returns guidance to re-OAuth with `scope=read,activity:read_all,profile:read_all`
+  instead of the generic "expired or revoked; reseed" message.
+- OAuth scope guidance in README updated: the authorization URL example now
+  includes `profile:read_all`. Without it, `strava_get_zone_distribution`
+  fails with 401 and `strava_get_athlete_profile` returns only summary
+  fields (no FTP, weight, gear, or measurement preference).
 - Server binds to `127.0.0.1` by default outside Docker; set `MCP_BIND_HOST` to
   override.
 - `VAULT_DB_PATH` defaults to `./data/vault.db` outside Docker; `/app/data/vault.db`

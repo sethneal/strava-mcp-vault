@@ -1,7 +1,10 @@
+import asyncio
+import functools
 import json
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -46,6 +49,32 @@ def _jsonify(obj) -> str:
     return json.dumps(obj, indent=2, default=str)
 
 
+def _with_timeout(seconds: float):
+    """Wrap an async tool body in asyncio.wait_for.
+
+    Turns silent hangs (stuck upstream call, DB lock, async deadlock) into
+    a clear, actionable error string after `seconds` instead of letting the
+    client wait minutes for its own timeout. functools.wraps preserves the
+    wrapped function's signature so FastMCP's parameter introspection still
+    sees the real arguments.
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await asyncio.wait_for(fn(*args, **kwargs), timeout=seconds)
+            except asyncio.TimeoutError:
+                logger.warning("Tool %s exceeded %ss budget", fn.__name__, seconds)
+                return (
+                    f"Tool {fn.__name__} timed out after {seconds}s. Possible "
+                    "causes: stuck upstream Strava call, DB lock, or server hang. "
+                    "Try strava_health_check to verify server state; restart "
+                    "the server if it persists."
+                )
+        return wrapper
+    return decorator
+
+
 def _tool_error(tool_name: str, e: Exception) -> str:
     """Map an exception to an actionable error string for MCP clients.
 
@@ -67,7 +96,23 @@ def _tool_error(tool_name: str, e: Exception) -> str:
                 return (
                     f"Strava API: insufficient scope on {e.path}. The current "
                     "tokens are missing 'activity:read_all'. Re-run the OAuth "
-                    "flow with scope=read,activity:read_all and update "
+                    "flow with scope=read,activity:read_all,profile:read_all "
+                    "and update STRAVA_ACCESS_TOKEN / STRAVA_REFRESH_TOKEN. "
+                    "See README#oauth-get-your-access-tokens."
+                )
+            # /athlete/zones requires profile:read_all. Strava sometimes
+            # returns a profile:read_permission marker, sometimes an empty
+            # body — so detect by marker OR by path.
+            if (
+                "profile:read_permission" in detail_lower
+                or e.path.startswith("/athlete/zones")
+            ):
+                return (
+                    f"Strava API: insufficient scope on {e.path}. The current "
+                    "tokens are missing 'profile:read_all' (required for "
+                    "/athlete/zones and the detailed /athlete profile with "
+                    "FTP, weight, and gear). Re-run the OAuth flow with "
+                    "scope=read,activity:read_all,profile:read_all and update "
                     "STRAVA_ACCESS_TOKEN / STRAVA_REFRESH_TOKEN. "
                     "See README#oauth-get-your-access-tokens."
                 )
@@ -165,6 +210,7 @@ mcp = FastMCP("strava_mcp", host="0.0.0.0", port=port, lifespan=lifespan)
         "openWorldHint": True,
     },
 )
+@_with_timeout(90)
 async def get_recent_activities(
     count: int = 10,
     offset: int = 0,
@@ -232,6 +278,7 @@ async def get_recent_activities(
         "openWorldHint": False,
     },
 )
+@_with_timeout(90)
 async def query_vault(
     sport_type: str | None = None,
     after: str | None = None,
@@ -280,6 +327,7 @@ async def query_vault(
         "openWorldHint": True,
     },
 )
+@_with_timeout(60)
 async def get_activity(
     activity_id: int, response_format: Literal["json", "markdown"] = "markdown"
 ) -> str:
@@ -308,6 +356,7 @@ async def get_activity(
         "openWorldHint": True,
     },
 )
+@_with_timeout(90)
 async def get_activity_streams(
     activity_id: int,
     stream_types: str = "heartrate,distance,altitude",
@@ -422,6 +471,7 @@ async def get_activity_streams(
         "openWorldHint": True,
     },
 )
+@_with_timeout(60)
 async def get_athlete_profile(response_format: Literal["json", "markdown"] = "markdown") -> str:
     """Get the authenticated Strava athlete's profile.
 
@@ -447,6 +497,7 @@ async def get_athlete_profile(response_format: Literal["json", "markdown"] = "ma
         "openWorldHint": True,
     },
 )
+@_with_timeout(60)
 async def get_athlete_stats(response_format: Literal["json", "markdown"] = "markdown") -> str:
     """Get year-to-date and all-time activity statistics.
 
@@ -480,6 +531,7 @@ def _validate_radius_miles(radius_miles: float) -> str | None:
         "openWorldHint": False,
     },
 )
+@_with_timeout(10)
 async def get_cache_stats(response_format: Literal["json", "markdown"] = "markdown") -> str:
     """Show cache hit/miss rates, stored items, and API rate limit status.
 
@@ -505,6 +557,7 @@ async def get_cache_stats(response_format: Literal["json", "markdown"] = "markdo
         "openWorldHint": True,
     },
 )
+@_with_timeout(60)
 async def get_activities_near(
     location: str,
     radius_miles: float = 20.0,
@@ -597,6 +650,7 @@ async def get_activities_near(
         "openWorldHint": False,
     },
 )
+@_with_timeout(30)
 async def set_activity_location(activity_id: int, location: str | None = None) -> str:
     """Manually set (or clear) the display location for a vault activity.
 
@@ -628,6 +682,7 @@ async def set_activity_location(activity_id: int, location: str | None = None) -
         "openWorldHint": False,
     },
 )
+@_with_timeout(30)
 async def delete_vault_activity(activity_ids: list[int]) -> str:
     """Delete one or more activities from the local vault by Strava activity ID.
 
@@ -657,6 +712,7 @@ async def delete_vault_activity(activity_ids: list[int]) -> str:
         "openWorldHint": True,
     },
 )
+@_with_timeout(300)
 async def sync_activities(days_back: int = 0, ctx: Context | None = None) -> str:
     """Sync Strava activities into the local vault.
 
@@ -690,6 +746,7 @@ async def sync_activities(days_back: int = 0, ctx: Context | None = None) -> str
         "openWorldHint": True,
     },
 )
+@_with_timeout(90)
 async def get_zone_distribution(
     activity_id: int,
     zone_type: Literal["hr", "power", "both"] = "both",
@@ -739,6 +796,7 @@ async def get_zone_distribution(
         "openWorldHint": True,
     },
 )
+@_with_timeout(90)
 async def get_power_curve(
     activity_id: int,
     durations: str = "5,15,30,60,300,600,1200,3600",
@@ -775,6 +833,7 @@ async def get_power_curve(
         "openWorldHint": True,
     },
 )
+@_with_timeout(90)
 async def get_hr_power_decoupling(
     activity_id: int,
     segment_minutes: int | None = None,
@@ -808,6 +867,7 @@ async def get_hr_power_decoupling(
         "openWorldHint": True,
     },
 )
+@_with_timeout(90)
 async def get_cardiac_drift(
     activity_id: int,
     response_format: Literal["json", "markdown"] = "markdown",
@@ -826,6 +886,79 @@ async def get_cardiac_drift(
         return format_cardiac_drift(result, activity_id)
     except Exception as e:
         return _tool_error("get_cardiac_drift", e)
+
+
+@mcp.tool(
+    name="strava_health_check",
+    annotations={
+        "title": "Probe auth + DB health",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@_with_timeout(10)
+async def health_check(response_format: Literal["json", "markdown"] = "markdown") -> str:
+    """Fast probe (<5s) that exercises Strava auth and the local DB.
+
+    Use this to detect a hung or misconfigured server before queuing real
+    tool calls. Reports per-probe ok/error, current access-token TTL, and
+    Strava rate-limit headroom (if any prior call has populated it).
+    """
+    auth_ok, auth_error = True, None
+    try:
+        await asyncio.wait_for(manager.client._ensure_valid_token(), timeout=4)
+    except Exception as e:
+        auth_ok = False
+        auth_error = _tool_error("health_check", e)
+
+    db_ok, db_error = True, None
+    try:
+        await asyncio.wait_for(manager.db.ping(), timeout=2)
+    except Exception as e:
+        db_ok = False
+        db_error = f"{type(e).__name__}: {e}"
+
+    expires_at = manager.client._expires_at or 0
+    token_ttl = max(0, int(expires_at - time.time()))
+    rate_limit = manager.client.rate_limit_remaining
+
+    status = "healthy" if (auth_ok and db_ok) else "degraded"
+
+    result = {
+        "status": status,
+        "auth": {"ok": auth_ok, "error": auth_error},
+        "db": {"ok": db_ok, "error": db_error},
+        "token_expires_in_seconds": token_ttl,
+        "rate_limit": rate_limit,
+    }
+
+    if response_format == "json":
+        return _jsonify(result)
+
+    lines = ["## 🩺 Health Check", ""]
+    lines.append(f"- **Status:** {status}")
+    if auth_ok:
+        lines.append("- **Auth:** OK")
+    else:
+        lines.append(f"- **Auth:** FAILED — {auth_error}")
+    if db_ok:
+        lines.append("- **Database:** OK")
+    else:
+        lines.append(f"- **Database:** FAILED — {db_error}")
+    if token_ttl:
+        hrs, rem = divmod(token_ttl, 3600)
+        mins = rem // 60
+        lines.append(f"- **Token TTL:** {hrs}h {mins}m")
+    if rate_limit:
+        short = rate_limit["short"]
+        lng = rate_limit["long"]
+        lines.append(
+            f"- **Rate limit:** short {short['usage']}/{short['limit']}, "
+            f"long {lng['usage']}/{lng['limit']}"
+        )
+    return "\n".join(lines)
 
 
 def main() -> None:
