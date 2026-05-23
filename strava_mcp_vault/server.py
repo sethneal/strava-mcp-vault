@@ -8,6 +8,7 @@ from typing import Literal
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 
+from strava_mcp_vault import stream_analysis
 from strava_mcp_vault.cache.db import CacheDB
 from strava_mcp_vault.cache.geocode import forward_geocode, reverse_geocode_many
 from strava_mcp_vault.cache.manager import CacheManager
@@ -20,11 +21,15 @@ from strava_mcp_vault.formatters import (
     format_athlete_profile,
     format_athlete_stats,
     format_cache_stats,
+    format_cardiac_drift,
+    format_decoupling,
     format_delete_activities,
+    format_power_curve,
     format_recent_activities,
     format_recent_activities_compact,
     format_sync_result,
     format_vault_query,
+    format_zone_distribution,
 )
 
 load_dotenv()
@@ -307,19 +312,102 @@ async def get_activity_streams(
     activity_id: int,
     stream_types: str = "heartrate,distance,altitude",
     response_format: Literal["json", "markdown"] = "markdown",
+    max_points: int | None = None,
+    export_path: str | None = None,
 ) -> str:
     """Get time-series data for an activity (heart rate, elevation, etc).
 
     Args:
         activity_id: The Strava activity ID.
-        stream_types: Comma-separated stream types (e.g. heartrate,distance,altitude).
-        response_format: "markdown" (default, human-readable) or "json" (machine-readable).
+        stream_types: Comma-separated stream types (e.g. heartrate,distance,altitude,watts).
+        response_format: "markdown" (default, human-readable summary + downsampled preview)
+            or "json" (machine-readable: {downsample: {...}, streams: {...}}).
+        max_points: If set, downsample each stream to at most this many evenly-spaced
+            points. Picking a value: for trend/shape analysis use ~500; for peak detection
+            use ~2000; for full data use None (but be aware of the ~1MB tool-result cap).
+        export_path: If set, write the full dataset to this path as JSON and return
+            a small pointer ({path, size_bytes, original_points, streams_written,
+            schema_version}). Bypasses the size guard — disk has no 1MB cap.
+            Defaults to ~/.strava-mcp-vault/exports/{activity_id}-{streams}-{epoch}.json
+            if you pass an empty string. Useful in Claude Desktop / Claude Code where
+            the model's python tool can read the file directly.
+
+    For computed metrics (zones, drift, power curve, decoupling), prefer the
+    purpose-built tools — they return small results and avoid the size cap entirely.
     """
     try:
-        result = await manager.get_activity_streams(activity_id, stream_types)
+        streams = await manager.get_streams_normalized(activity_id, stream_types)
+        # Belt-and-suspenders: filter to requested keys again
+        requested = {t.strip() for t in stream_types.split(",")}
+        streams = {k: v for k, v in streams.items() if k in requested}
+
+        if not streams:
+            return _tool_error(
+                "get_activity_streams",
+                ValueError(f"no requested streams available for activity {activity_id}"),
+            )
+
+        # Export path bypasses size guard — disk has no cap
+        if export_path is not None:
+            import time as _time
+            from pathlib import Path
+
+            if export_path == "":
+                default_dir = Path.home() / ".strava-mcp-vault" / "exports"
+                default_dir.mkdir(parents=True, exist_ok=True)
+                stream_key = "-".join(sorted(streams.keys()))
+                epoch = int(_time.time())
+                target = default_dir / f"{activity_id}-{stream_key}-{epoch}.json"
+            else:
+                target = Path(export_path).expanduser()
+                target.parent.mkdir(parents=True, exist_ok=True)
+
+            original_points = max(len(v) for v in streams.values() if isinstance(v, list))
+            file_payload = {
+                "schema_version": "1",
+                "downsample": {
+                    "original_points": original_points,
+                    "returned_points": original_points,
+                    "step": 1,
+                    "reason": "none",
+                },
+                "streams": streams,
+            }
+            target.write_text(_jsonify(file_payload))
+            return _jsonify({
+                "path": str(target),
+                "size_bytes": target.stat().st_size,
+                "original_points": original_points,
+                "streams_written": sorted(streams.keys()),
+                "schema_version": "1",
+            })
+
+        # Pre-flight size guard
+        SIZE_GUARD_BYTES = 800_000
+        if max_points is None:
+            estimated = stream_analysis.estimate_response_bytes(streams)
+            if estimated > SIZE_GUARD_BYTES:
+                rec = stream_analysis.recommended_max_points(streams, target_bytes=SIZE_GUARD_BYTES)
+                original_points = max(len(v) for v in streams.values() if isinstance(v, list))
+                return _jsonify({
+                    "error": "response_too_large",
+                    "original_points": original_points,
+                    "estimated_bytes": estimated,
+                    "recommended_max_points": rec,
+                    "message": (
+                        f"Response would exceed 1MB ({estimated:,} bytes estimated). "
+                        f"Retry with max_points={rec} for downsampled data, "
+                        f"or use the purpose-built tools (strava_get_zone_distribution, "
+                        f"strava_get_power_curve, strava_get_cardiac_drift, "
+                        f"strava_get_hr_power_decoupling) which return small computed results."
+                    ),
+                })
+
+        downsampled, downsample_meta = stream_analysis.downsample(streams, max_points)
+        payload = {"downsample": downsample_meta, "streams": downsampled}
         if response_format == "json":
-            return _jsonify(result)
-        return format_activity_streams(result, activity_id)
+            return _jsonify(payload)
+        return format_activity_streams(payload, activity_id)
     except Exception as e:
         return _tool_error("get_activity_streams", e)
 
@@ -590,6 +678,154 @@ async def sync_activities(days_back: int = 0, ctx: Context | None = None) -> str
         return format_sync_result(result)
     except Exception as e:
         return _tool_error("sync_activities", e)
+
+
+@mcp.tool(
+    name="strava_get_zone_distribution",
+    annotations={
+        "title": "Time spent in each HR / power zone",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def get_zone_distribution(
+    activity_id: int,
+    zone_type: Literal["hr", "power", "both"] = "both",
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Compute time spent in each HR and/or power zone for an activity.
+
+    Returns a small computed result (no raw streams) — safe against the 1MB cap.
+
+    Zones come from your Strava athlete zones config (cached 24h). If a zone
+    type isn't configured on Strava, that side of the response is null with a reason.
+    """
+    try:
+        keys = []
+        if zone_type in ("hr", "both"):
+            keys.append("heartrate")
+        if zone_type in ("power", "both"):
+            keys.append("watts")
+        keys.append("time")
+        stream_types = ",".join(keys)
+
+        streams = await manager.get_streams_normalized(activity_id, stream_types)
+        zones_raw = await manager.get_athlete_zones()
+
+        hr_zones = (zones_raw or {}).get("heart_rate", {}).get("zones") if zone_type in ("hr", "both") else None
+        power_zones = (zones_raw or {}).get("power", {}).get("zones") if zone_type in ("power", "both") else None
+
+        result = stream_analysis.compute_zone_distribution(
+            streams, hr_zones=hr_zones, power_zones=power_zones
+        )
+        result["activity_id"] = activity_id
+
+        if response_format == "json":
+            return _jsonify(result)
+        return format_zone_distribution(result, activity_id)
+    except Exception as e:
+        return _tool_error("get_zone_distribution", e)
+
+
+@mcp.tool(
+    name="strava_get_power_curve",
+    annotations={
+        "title": "Power curve (mean-max power at standard durations)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def get_power_curve(
+    activity_id: int,
+    durations: str = "5,15,30,60,300,600,1200,3600",
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Best mean-max power at each requested duration (seconds, comma-separated).
+
+    Foundation for fitness comparison across activities. Returns a small computed
+    result. Requires the activity to have a `watts` stream (power meter).
+    """
+    try:
+        streams = await manager.get_streams_normalized(activity_id, "watts")
+        try:
+            durations_list = [int(d.strip()) for d in durations.split(",") if d.strip()]
+        except ValueError as ve:
+            return _tool_error("get_power_curve", ve)
+
+        result = stream_analysis.compute_power_curve(streams, durations_list)
+        result["activity_id"] = activity_id
+        if response_format == "json":
+            return _jsonify(result)
+        return format_power_curve(result, activity_id)
+    except Exception as e:
+        return _tool_error("get_power_curve", e)
+
+
+@mcp.tool(
+    name="strava_get_hr_power_decoupling",
+    annotations={
+        "title": "Pa:HR decoupling between two segments",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def get_hr_power_decoupling(
+    activity_id: int,
+    segment_minutes: int | None = None,
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Pa:HR decoupling — change in NP/HR between two segments.
+
+    Requires both heartrate and watts streams. If segment_minutes is None,
+    splits the activity in half; otherwise compares first N minutes vs last
+    N minutes. |decoupling| > 5% is the conventional threshold for aerobic
+    decoupling.
+    """
+    try:
+        streams = await manager.get_streams_normalized(activity_id, "heartrate,watts")
+        result = stream_analysis.compute_decoupling(streams, segment_minutes)
+        result["activity_id"] = activity_id
+        if response_format == "json":
+            return _jsonify(result)
+        return format_decoupling(result, activity_id)
+    except Exception as e:
+        return _tool_error("get_hr_power_decoupling", e)
+
+
+@mcp.tool(
+    name="strava_get_cardiac_drift",
+    annotations={
+        "title": "Cardiac drift across an activity",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def get_cardiac_drift(
+    activity_id: int,
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """First-half vs second-half HR drift, with optional Pa:HR decoupling if power present.
+
+    Requires heartrate stream; uses watts if available. Errors if activity is
+    shorter than 20 minutes.
+    """
+    try:
+        streams = await manager.get_streams_normalized(activity_id, "heartrate,watts")
+        result = stream_analysis.compute_cardiac_drift(streams)
+        result["activity_id"] = activity_id
+        if response_format == "json":
+            return _jsonify(result)
+        return format_cardiac_drift(result, activity_id)
+    except Exception as e:
+        return _tool_error("get_cardiac_drift", e)
 
 
 def main() -> None:

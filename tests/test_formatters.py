@@ -14,11 +14,14 @@ from strava_mcp_vault.formatters import (
     format_athlete_profile,
     format_athlete_stats,
     format_cache_stats,
+    format_decoupling,
     format_delete_activities,
+    format_power_curve,
     format_recent_activities,
     format_recent_activities_compact,
     format_sync_result,
     format_vault_query,
+    format_zone_distribution,
 )
 
 # ── Helper functions ───────────────────────────────────────────────────
@@ -478,3 +481,149 @@ def test_format_delete_activities_success():
 def test_format_delete_activities_partial():
     result = format_delete_activities(1, [1, 2, 3])
     assert "Not found" in result
+
+
+# ── format_zone_distribution ──────────────────────────────────────────────────
+
+
+def test_format_zone_distribution_both_present():
+    data = {
+        "duration_s": 3600,
+        "hr": [
+            {"zone": 1, "name": "Recovery", "min": 0, "max": 115, "time_s": 600, "pct": 16.7},
+            {"zone": 2, "name": "Endurance", "min": 115, "max": 132, "time_s": 3000, "pct": 83.3},
+        ],
+        "power": [
+            {"zone": 1, "name": "Active Recovery", "min": 0, "max": 100, "time_s": 1800, "pct": 50.0},
+        ],
+    }
+    md = format_zone_distribution(data, activity_id=42)
+    assert "HR Zones" in md
+    assert "Recovery" in md
+    assert "16.7%" in md
+    assert "Power Zones" in md
+
+
+def test_format_zone_distribution_hr_only():
+    data = {
+        "duration_s": 3600,
+        "hr": [{"zone": 1, "name": "Recovery", "min": 0, "max": 115, "time_s": 3600, "pct": 100.0}],
+        "power": None,
+    }
+    md = format_zone_distribution(data, activity_id=42)
+    assert "HR Zones" in md
+    # Power section should not appear OR should show a clear absence indicator
+    assert "Power Zones" not in md or "no power" in md.lower()
+
+
+def test_format_zone_distribution_none_present():
+    data = {"duration_s": 3600, "hr": None, "power": None}
+    md = format_zone_distribution(data, activity_id=42)
+    assert "no zones" in md.lower() or "unavailable" in md.lower()
+
+
+# ── Power curve formatter tests ────────────────────────────────────────
+
+
+def test_format_power_curve_basic():
+    data = {
+        "activity_id": 42,
+        "duration_s": 3600,
+        "avg_power": 200.0,
+        "normalized_power": 215.5,
+        "points": [
+            {"duration_s": 5, "best_watts": 850},
+            {"duration_s": 60, "best_watts": 410},
+            {"duration_s": 1200, "best_watts": 280},
+        ],
+        "omitted": [],
+    }
+    md = format_power_curve(data, activity_id=42)
+    assert "850" in md
+    assert "Avg Power" in md or "AP" in md
+    assert "Normalized Power" in md or "NP" in md
+
+
+def test_format_power_curve_no_data():
+    md = format_power_curve({"error": "no_power_data"}, activity_id=42)
+    assert "no power" in md.lower()
+
+
+def test_format_power_curve_with_omitted():
+    data = {
+        "activity_id": 42,
+        "duration_s": 600,
+        "avg_power": 200.0,
+        "normalized_power": 210.0,
+        "points": [{"duration_s": 5, "best_watts": 800}],
+        "omitted": [{"duration_s": 3600, "reason": "longer than activity"}],
+    }
+    md = format_power_curve(data, activity_id=42)
+    assert "3600" in md or "omitted" in md.lower() or "skipped" in md.lower()
+
+
+# ── format_decoupling ─────────────────────────────────────────────────
+
+
+def test_format_decoupling_basic():
+    data = {
+        "activity_id": 42,
+        "segment_minutes": None,
+        "first_segment": {"start_s": 0, "end_s": 1800, "avg_hr": 140.0, "np": 215.0, "np_per_hr": 1.536},
+        "second_segment": {"start_s": 1800, "end_s": 3600, "avg_hr": 150.0, "np": 215.0, "np_per_hr": 1.433},
+        "decoupling_pct": -6.7,
+        "threshold_5pct_exceeded": True,
+        "methodology": "...",
+    }
+    md = format_decoupling(data, activity_id=42)
+    assert "-6.7" in md
+    assert "exceeds 5%" in md.lower() or "above threshold" in md.lower() or "exceeded" in md.lower()
+
+
+def test_format_decoupling_missing_stream():
+    data = {"error": "missing_required_stream", "required": "watts"}
+    md = format_decoupling(data, activity_id=42)
+    assert "watts" in md.lower() or "missing" in md.lower()
+
+
+# ── Cardiac drift formatter tests ──────────────────────────────────────────
+
+from strava_mcp_vault.formatters import format_cardiac_drift  # noqa: E402
+
+
+def test_format_cardiac_drift_with_power():
+    data = {
+        "activity_id": 42,
+        "duration_s": 3600,
+        "first_half": {"avg_hr": 140.0, "avg_power": 200.0, "np": 210.0},
+        "second_half": {"avg_hr": 152.0, "avg_power": 198.0, "np": 208.0},
+        "hr_drift_pct": 8.57,
+        "decoupling_pct": -3.5,
+        "threshold_5pct_exceeded": False,
+        "methodology": "...",
+    }
+    md = format_cardiac_drift(data, activity_id=42)
+    assert "8.57" in md
+    assert "140" in md and "152" in md
+
+
+def test_format_cardiac_drift_too_short():
+    data = {"error": "activity_too_short", "minimum_s": 1200}
+    md = format_cardiac_drift(data, activity_id=42)
+    assert "too short" in md.lower() or "minimum" in md.lower()
+
+
+def test_format_cardiac_drift_no_power_partial():
+    data = {
+        "activity_id": 42,
+        "duration_s": 1500,
+        "first_half": {"avg_hr": 140.0, "avg_power": None, "np": None},
+        "second_half": {"avg_hr": 148.0, "avg_power": None, "np": None},
+        "hr_drift_pct": 5.71,
+        "decoupling_pct": None,
+        "threshold_5pct_exceeded": False,
+        "methodology": "...",
+    }
+    md = format_cardiac_drift(data, activity_id=42)
+    assert "5.71" in md
+    assert "no power" in md.lower() or "n/a" in md.lower()

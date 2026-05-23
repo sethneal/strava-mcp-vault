@@ -1,5 +1,6 @@
 """Tests for server.py validation helpers and tool functions."""
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -201,3 +202,267 @@ def test_format_error_401_without_scope_hint_says_reseed():
     msg = _tool_error("strava_get_recent_activities", err)
 
     assert "reseed" in msg.lower() or "re-seed" in msg.lower()
+
+
+# ── get_activity_streams: defensive filter + downsample ───────────────
+
+
+@pytest.mark.asyncio
+async def test_get_activity_streams_filters_extra_streams(mock_manager):
+    """Defensive: even if manager returns extras, server filters to requested."""
+    mock_manager.get_streams_normalized.return_value = {
+        "heartrate": [120, 130],
+        "watts": [200, 210],
+    }
+    import json
+
+    from strava_mcp_vault.server import get_activity_streams
+    result = await get_activity_streams(
+        activity_id=1, stream_types="heartrate", response_format="json"
+    )
+    payload = json.loads(result)
+    assert "watts" not in payload["streams"]
+    assert payload["streams"]["heartrate"] == [120, 130]
+
+
+@pytest.mark.asyncio
+async def test_get_activity_streams_downsample_block_present(mock_manager):
+    mock_manager.get_streams_normalized.return_value = {"heartrate": list(range(1000))}
+    import json
+
+    from strava_mcp_vault.server import get_activity_streams
+    result = await get_activity_streams(
+        activity_id=1, stream_types="heartrate", max_points=100, response_format="json"
+    )
+    payload = json.loads(result)
+    assert payload["downsample"]["original_points"] == 1000
+    assert payload["downsample"]["returned_points"] == 100
+    assert payload["downsample"]["reason"] == "user_requested"
+    assert len(payload["streams"]["heartrate"]) == 100
+
+
+@pytest.mark.asyncio
+async def test_get_activity_streams_no_downsample_reason_none(mock_manager):
+    mock_manager.get_streams_normalized.return_value = {"heartrate": [120, 130, 140]}
+    import json
+
+    from strava_mcp_vault.server import get_activity_streams
+    result = await get_activity_streams(
+        activity_id=1, stream_types="heartrate", response_format="json"
+    )
+    payload = json.loads(result)
+    assert payload["downsample"]["reason"] == "none"
+
+
+# ── get_activity_streams: pre-flight size guard ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_activity_streams_size_guard_fires_when_oversize():
+    # 5 streams x 50_000 points x 10 bytes x 1.2 = 3MB → triggers guard
+    async def fake_normalized(activity_id, stream_types):
+        return {k: list(range(50_000)) for k in ["heartrate", "watts", "time", "altitude", "cadence"]}
+
+    m = AsyncMock()
+    m.get_streams_normalized = fake_normalized
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import get_activity_streams
+        result = await get_activity_streams(
+            activity_id=1,
+            stream_types="heartrate,watts,time,altitude,cadence",
+            response_format="json",
+        )
+    payload = json.loads(result)
+    assert payload["error"] == "response_too_large"
+    assert payload["original_points"] == 50_000
+    assert payload["recommended_max_points"] > 100
+    assert "max_points=" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_get_activity_streams_size_guard_bypassed_when_max_points_set():
+    async def fake_normalized(activity_id, stream_types):
+        return {k: list(range(50_000)) for k in ["heartrate", "watts", "time"]}
+
+    m = AsyncMock()
+    m.get_streams_normalized = fake_normalized
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import get_activity_streams
+        result = await get_activity_streams(
+            activity_id=1,
+            stream_types="heartrate,watts,time",
+            max_points=500,
+            response_format="json",
+        )
+    payload = json.loads(result)
+    assert "error" not in payload
+    assert payload["downsample"]["returned_points"] == 500
+
+
+# ── get_activity_streams: export_path mode ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_activity_streams_export_path_writes_file(tmp_path):
+    """export_path mode writes full dataset to disk + returns pointer."""
+    export_file = tmp_path / "streams-out.json"
+
+    async def fake_normalized(activity_id, stream_types):
+        return {"heartrate": list(range(100)), "watts": list(range(100, 200))}
+
+    m = AsyncMock()
+    m.get_streams_normalized = fake_normalized
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import get_activity_streams
+        result = await get_activity_streams(
+            activity_id=42,
+            stream_types="heartrate,watts",
+            export_path=str(export_file),
+            response_format="json",
+        )
+
+    payload = json.loads(result)
+    assert payload["path"] == str(export_file)
+    assert payload["original_points"] == 100
+    assert payload["streams_written"] == ["heartrate", "watts"]
+    assert payload["schema_version"] == "1"
+    assert payload["size_bytes"] > 0
+    assert export_file.exists()
+
+    file_content = json.loads(export_file.read_text())
+    assert file_content["streams"]["heartrate"] == list(range(100))
+    assert file_content["streams"]["watts"] == list(range(100, 200))
+    assert file_content["downsample"]["reason"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_get_activity_streams_export_path_bypasses_size_guard(tmp_path):
+    """Even when oversize, export_path writes to disk regardless."""
+    export_file = tmp_path / "big.json"
+
+    async def fake_normalized(activity_id, stream_types):
+        return {k: list(range(50_000)) for k in ["heartrate", "watts", "time", "altitude", "cadence"]}
+
+    m = AsyncMock()
+    m.get_streams_normalized = fake_normalized
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import get_activity_streams
+        result = await get_activity_streams(
+            activity_id=1,
+            stream_types="heartrate,watts,time,altitude,cadence",
+            export_path=str(export_file),
+            response_format="json",
+        )
+
+    payload = json.loads(result)
+    assert "error" not in payload
+    assert export_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_get_activity_streams_export_path_unwritable_errors():
+    """Unwritable path errors cleanly (no silent fallback)."""
+    async def fake_normalized(activity_id, stream_types):
+        return {"heartrate": [120, 130, 140]}
+
+    m = AsyncMock()
+    m.get_streams_normalized = fake_normalized
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import get_activity_streams
+        result = await get_activity_streams(
+            activity_id=1,
+            stream_types="heartrate",
+            export_path="/nonexistent_root_dir_xyz/file.json",
+            response_format="json",
+        )
+
+    assert "error" in result.lower() or "permission" in result.lower() or "no such" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_get_zone_distribution_tool():
+    """Tool wires together stream fetch, zones fetch, compute, and format."""
+    # heartrate stream: 600 samples at 120 bpm (1 Hz → 600 s total)
+    hr_stream = [120] * 600
+    fake_streams = {"heartrate": hr_stream, "time": list(range(600))}
+
+    fake_zones = {
+        "heart_rate": {
+            "zones": [
+                {"min": 0, "max": 115},
+                {"min": 115, "max": 152},
+                {"min": 152, "max": 171},
+                {"min": 171, "max": 190},
+                {"min": 190, "max": -1},
+            ]
+        },
+        "power": {"zones": [{"min": 0, "max": 180}]},
+    }
+
+    m = AsyncMock()
+    m.get_streams_normalized = AsyncMock(return_value=fake_streams)
+    m.get_athlete_zones = AsyncMock(return_value=fake_zones)
+
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import get_zone_distribution
+        result = await get_zone_distribution(
+            activity_id=1,
+            zone_type="hr",
+            response_format="json",
+        )
+
+    payload = json.loads(result)
+    assert payload["hr"] is not None
+    # All time should land in zone 2 (115–152), since HR=120 is in that range.
+    # time=[0..599] → 599 deltas of 1 s each → 599 s total in zone 2.
+    zone2 = next(z for z in payload["hr"] if z["zone"] == 2)
+    assert zone2["time_s"] == 599
+
+
+@pytest.mark.asyncio
+async def test_get_power_curve_tool():
+    """Tool fetches watts stream, computes power curve, returns json."""
+    # 600 samples at 200 W → best at any duration == 200 W
+    m = AsyncMock()
+    m.get_streams_normalized = AsyncMock(return_value={"watts": [200] * 600})
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import get_power_curve
+        result = await get_power_curve(
+            activity_id=1,
+            durations="5,60,300",
+            response_format="json",
+        )
+    payload = json.loads(result)
+    assert payload["activity_id"] == 1
+    assert all(p["best_watts"] == 200 for p in payload["points"])
+
+
+@pytest.mark.asyncio
+async def test_get_hr_power_decoupling_tool():
+    """Tool fetches streams, computes decoupling, returns json."""
+    # 600 samples at 140 bpm + 200 W → both segments identical → 0% decoupling
+    m = AsyncMock()
+    m.get_streams_normalized = AsyncMock(
+        return_value={"heartrate": [140] * 600, "watts": [200] * 600}
+    )
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import get_hr_power_decoupling
+        result = await get_hr_power_decoupling(activity_id=1, response_format="json")
+    payload = json.loads(result)
+    assert payload["activity_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_cardiac_drift_tool():
+    """Tool fetches streams, computes cardiac drift, returns json."""
+    m = AsyncMock()
+    m.get_streams_normalized = AsyncMock(
+        return_value={"heartrate": [130] * 700 + [150] * 700, "watts": [200] * 1400}
+    )
+    with patch("strava_mcp_vault.server.manager", m):
+        from strava_mcp_vault.server import get_cardiac_drift
+        result = await get_cardiac_drift(activity_id=1, response_format="json")
+    payload = json.loads(result)
+    assert payload["activity_id"] == 1
+    assert payload["first_half"]["avg_hr"] == 130.0
+    assert payload["second_half"]["avg_hr"] == 150.0

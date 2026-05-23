@@ -1,5 +1,7 @@
 """Tests for cache/manager.py."""
 
+import pytest
+
 from strava_mcp_vault.cache.manager import _format_duration, _shape_activity
 
 # ── Helper functions ───────────────────────────────────────────────────
@@ -189,3 +191,90 @@ async def test_gear_resolution(cache_manager, tmp_db, sample_activity):
     result = await cache_manager.get_recent_activities(count=5)
     # The mock client returns {"name": "Trek Domane"} for get_gear
     assert any(a.get("gear_name") == "Trek Domane" for a in result)
+
+
+async def test_get_athlete_zones_cached(cache_manager):
+    cache_manager.client.get_athlete_zones.return_value = {
+        "heart_rate": {"zones": [{"min": 0, "max": 115}, {"min": 115, "max": 132}]},
+        "power": {"zones": [{"min": 0, "max": 180}]},
+    }
+    first = await cache_manager.get_athlete_zones()
+    second = await cache_manager.get_athlete_zones()
+    assert first == second
+    cache_manager.client.get_athlete_zones.assert_called_once()
+
+
+async def test_get_athlete_zones_passes_through(cache_manager):
+    cache_manager.client.get_athlete_zones.return_value = {"heart_rate": None, "power": None}
+    result = await cache_manager.get_athlete_zones()
+    assert result == {"heart_rate": None, "power": None}
+
+
+# ── get_streams_normalized ─────────────────────────────────────────────
+
+
+async def test_get_streams_normalized_from_list_form(cache_manager):
+    cache_manager.client.get_activity_streams.return_value = [
+        {"type": "heartrate", "data": [120, 130, 140]},
+        {"type": "watts", "data": [200, 210, 220]},
+    ]
+    result = await cache_manager.get_streams_normalized(123, "heartrate,watts")
+    assert result == {"heartrate": [120, 130, 140], "watts": [200, 210, 220]}
+
+
+async def test_get_streams_normalized_from_dict_form(cache_manager):
+    cache_manager.client.get_activity_streams.return_value = {
+        "heartrate": {"data": [120, 130], "original_size": 2},
+        "watts": {"data": [200, 210]},
+    }
+    result = await cache_manager.get_streams_normalized(123, "heartrate,watts")
+    assert result == {"heartrate": [120, 130], "watts": [200, 210]}
+
+
+async def test_get_streams_normalized_filters_to_requested(cache_manager):
+    """Defensive: Strava may return extra streams; we only keep requested."""
+    cache_manager.client.get_activity_streams.return_value = [
+        {"type": "heartrate", "data": [120, 130]},
+        {"type": "distance", "data": [0, 5.0]},  # not requested
+    ]
+    result = await cache_manager.get_streams_normalized(123, "heartrate")
+    assert "distance" not in result
+    assert result == {"heartrate": [120, 130]}
+
+
+async def test_get_streams_normalized_raises_when_requested_absent(cache_manager):
+    """Regression: requested stream not in Strava response → structured error
+    with the list of streams Strava actually returned.
+
+    This was the Chat-reported bug: asking for watts on activity 14583851847
+    silently returned 'no power data' because Strava 200'd with a distance
+    stream we then filtered out — leaving the agent unable to tell whether the
+    activity had no power or whether the ID was wrong entirely.
+    """
+    from strava_mcp_vault.exceptions import NoMatchingStreamsError
+
+    cache_manager.client.get_activity_streams.return_value = [
+        {"type": "distance", "data": [0, 5.0]},  # Strava returned this
+    ]
+    with pytest.raises(NoMatchingStreamsError) as exc_info:
+        await cache_manager.get_streams_normalized(14583851847, "watts")
+
+    err = exc_info.value
+    assert err.activity_id == 14583851847
+    assert err.requested == ["watts"]
+    assert err.available == ["distance"]
+    assert "watts" in str(err)
+    assert "distance" in str(err)
+
+
+async def test_get_streams_normalized_raises_when_strava_returns_nothing(cache_manager):
+    """Empty Strava response → error reports empty available list."""
+    from strava_mcp_vault.exceptions import NoMatchingStreamsError
+
+    cache_manager.client.get_activity_streams.return_value = []
+    with pytest.raises(NoMatchingStreamsError) as exc_info:
+        await cache_manager.get_streams_normalized(999, "watts,heartrate")
+
+    err = exc_info.value
+    assert err.available == []
+    assert "(none)" in str(err)

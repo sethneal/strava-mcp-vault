@@ -16,6 +16,8 @@ import logging
 import time
 from datetime import datetime
 
+from strava_mcp_vault.exceptions import NoMatchingStreamsError
+
 METERS_PER_MILE = 1609.344
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,7 @@ TTL = {
     "activity_detail": 86400,  # 24 hours
     "activity_streams": 604800,  # 7 days
     "athlete_profile": 86400,  # 24 hours
+    "athlete_zones": 86400,  # 24 hours
     "athlete_stats": 86400,  # 1 day
 }
 
@@ -452,6 +455,19 @@ class CacheManager:
         await self.db.set_cached(key, category, result, TTL[category])
         return result
 
+    async def get_athlete_zones(self) -> dict:
+        """Return athlete HR + power zones from Strava, cached 24 hours."""
+        key = "athlete:zones"
+        category = "athlete_zones"
+
+        cached = await self.db.get_cached(key)
+        if cached is not None:
+            return cached
+
+        result = await self.client.get_athlete_zones()
+        await self.db.set_cached(key, category, result, TTL[category])
+        return result
+
     async def get_athlete_stats(self) -> dict:
         """Return athlete stats, cached for 1 day."""
         key = "athlete:stats"
@@ -467,6 +483,53 @@ class CacheManager:
 
         await self.db.set_cached(key, category, result, TTL[category])
         return result
+
+    async def get_streams_normalized(
+        self,
+        activity_id: int,
+        stream_types: str,
+    ) -> dict[str, list]:
+        """Fetch streams and return as flat {stream_type: [data]} dict.
+
+        Filters defensively to only the requested stream types — addresses
+        Strava returning extra paired streams (e.g. distance with key_type=time).
+
+        Raises NoMatchingStreamsError when the filtered result is empty, so
+        callers can distinguish "this activity lacks the requested streams"
+        from "the activity ID is wrong or inaccessible". The error message
+        includes the list of stream types Strava actually returned.
+        """
+        raw = await self.get_activity_streams(activity_id, stream_types)
+        requested = {t.strip() for t in stream_types.split(",")}
+
+        # Inventory ALL stream types Strava returned, before filtering. Used
+        # to produce a useful error message when the filtered result is empty.
+        available: set[str] = set()
+        if isinstance(raw, list):
+            for s in raw:
+                if isinstance(s, dict) and "type" in s:
+                    available.add(s["type"])
+        elif isinstance(raw, dict):
+            available = set(raw.keys())
+
+        out: dict[str, list] = {}
+        if isinstance(raw, list):
+            for s in raw:
+                if isinstance(s, dict) and s.get("type") in requested:
+                    out[s["type"]] = s.get("data", [])
+        elif isinstance(raw, dict):
+            for k, v in raw.items():
+                if k not in requested:
+                    continue
+                if isinstance(v, dict) and "data" in v:
+                    out[k] = v["data"]
+                elif isinstance(v, list):
+                    out[k] = v
+
+        if not out:
+            raise NoMatchingStreamsError(activity_id, requested, available)
+
+        return out
 
     async def get_cache_stats(self) -> dict:
         """Return cache + vault statistics combined with API rate-limit info."""

@@ -675,15 +675,32 @@ def format_activity_detail(activity: dict) -> str:
     return "\n".join(lines)
 
 
-def format_activity_streams(streams: dict | list, activity_id: int) -> str:
-    """Format activity streams as a compact markdown summary.
+def format_activity_streams(payload: dict | list, activity_id: int) -> str:
+    """Format activity streams as markdown with summary stats and downsample banner.
 
-    Streams can be a dict of {type: {data: [...], ...}} or a list of
-    stream objects with 'type' and 'data' keys.
+    Accepts either:
+      - new shape: {"downsample": {...}, "streams": {type: [data]}}
+      - legacy shapes: raw Strava list/dict (for backward compat)
     """
     lines = [f"## Activity Streams (ID: {activity_id})\n"]
+    downsample_meta = None
+    streams: dict | list = payload
 
-    # Normalize to dict form
+    if isinstance(payload, dict) and "streams" in payload and "downsample" in payload:
+        downsample_meta = payload["downsample"]
+        streams = payload["streams"]
+
+    # Banner when downsampled
+    if downsample_meta and downsample_meta.get("reason") == "user_requested":
+        orig = downsample_meta["original_points"]
+        ret = downsample_meta["returned_points"]
+        step = downsample_meta["step"]
+        lines.append(
+            f"> Downsampled {orig:,} -> {ret:,} points (every {step}th sample). "
+            f"Pass max_points=N to change. Pass export_path=/path/to/file.json for full data.\n"
+        )
+
+    # Normalize legacy shapes to dict form
     if isinstance(streams, list):
         stream_dict = {}
         for s in streams:
@@ -695,8 +712,6 @@ def format_activity_streams(streams: dict | list, activity_id: int) -> str:
         for k, v in streams.items():
             if isinstance(v, dict) and "data" in v:
                 normalized[k] = v["data"]
-            elif isinstance(v, list):
-                normalized[k] = v
             else:
                 normalized[k] = v
         streams = normalized
@@ -725,11 +740,24 @@ def format_activity_streams(streams: dict | list, activity_id: int) -> str:
             lines.append(f"- **Min:** {min_val:.1f}{unit}")
             lines.append(f"- **Max:** {max_val:.1f}{unit}")
             lines.append(f"- **Avg:** {avg_val:.1f}{unit}")
+
+            # Inline preview: up to 60 evenly-spaced points
+            preview = _stream_preview(numeric_data, max_preview=60)
+            lines.append(f"- **Preview ({len(preview)} pts):** `{preview}`")
             lines.append("")
         else:
             lines.append(f"**{stream_type}:** {len(data)} data points\n")
 
     return "\n".join(lines)
+
+
+def _stream_preview(data: list, max_preview: int = 60) -> list:
+    """Evenly-spaced sample of up to max_preview points for inline display."""
+    import math
+    if len(data) <= max_preview:
+        return [round(x, 1) if isinstance(x, float) else x for x in data]
+    step = math.ceil(len(data) / max_preview)
+    return [round(x, 1) if isinstance(x, float) else x for x in data[::step]]
 
 
 def _stream_unit(stream_type: str) -> str:
@@ -1053,4 +1081,131 @@ def format_delete_activities(deleted: int, requested_ids: list[int]) -> str:
     if not_found:
         lines.append(f"- **⚠️ Not found:** {not_found} (already removed or invalid ID)")
     lines.append(f"- **🏛️ IDs requested:** {', '.join(str(i) for i in requested_ids)}")
+    return "\n".join(lines)
+
+
+def format_zone_distribution(data: dict, activity_id: int) -> str:
+    """Format zone distribution as markdown table per zone type."""
+    lines = [f"## Zone Distribution (Activity {activity_id})\n"]
+    duration_min = data.get("duration_s", 0) // 60
+    lines.append(f"**Total duration:** {duration_min} min\n")
+
+    def _zone_table(title: str, zones: list[dict]) -> list[str]:
+        out = [f"### {title}"]
+        out.append("| Zone | Name | Range | Time | % |")
+        out.append("|---|---|---|---|---|")
+        for z in zones:
+            mins = z["time_s"] // 60
+            secs = z["time_s"] % 60
+            out.append(
+                f"| Z{z['zone']} | {z['name']} | {z['min']}–{z['max']} | "
+                f"{mins}m {secs}s | {z['pct']:.1f}% |"
+            )
+        out.append("")
+        return out
+
+    has_any = False
+    if data.get("hr"):
+        lines.extend(_zone_table("HR Zones", data["hr"]))
+        has_any = True
+    if data.get("power"):
+        lines.extend(_zone_table("Power Zones", data["power"]))
+        has_any = True
+
+    if not has_any:
+        lines.append("No zones available — set HR max and/or FTP on Strava.")
+    return "\n".join(lines)
+
+
+def format_decoupling(data: dict, activity_id: int) -> str:
+    """Format Pa:HR decoupling result as markdown."""
+    if data.get("error") == "missing_required_stream":
+        return (
+            f"## HR/Power Decoupling (Activity {activity_id})\n\n"
+            f"Missing required stream: **{data['required']}**. "
+            f"This metric requires both heartrate and watts data."
+        )
+    lines = [f"## HR/Power Decoupling (Activity {activity_id})\n"]
+    seg = data.get("segment_minutes")
+    lines.append(f"**Split:** {'first/second half' if seg is None else f'first/last {seg} min'}\n")
+    s1, s2 = data["first_segment"], data["second_segment"]
+    lines.append("| Segment | Avg HR | NP | NP/HR |")
+    lines.append("|---|---|---|---|")
+    lines.append(f"| 1st | {s1['avg_hr']:.0f} | {s1['np']:.0f} | {s1['np_per_hr']:.3f} |")
+    lines.append(f"| 2nd | {s2['avg_hr']:.0f} | {s2['np']:.0f} | {s2['np_per_hr']:.3f} |")
+    lines.append("")
+    lines.append(f"**Decoupling:** {data['decoupling_pct']:+.2f}%")
+    if data.get("threshold_5pct_exceeded"):
+        lines.append("⚠ Exceeded 5% threshold — aerobic decoupling indicated.")
+    else:
+        lines.append("✓ Under 5% threshold — efficiency held.")
+    lines.append("")
+    lines.append(f"_{data.get('methodology', '')}_")
+    return "\n".join(lines)
+
+
+def format_power_curve(data: dict, activity_id: int) -> str:
+    if data.get("error") == "no_power_data":
+        return f"## Power Curve (Activity {activity_id})\n\nNo power data in this activity."
+
+    lines = [f"## Power Curve (Activity {activity_id})\n"]
+    lines.append(f"**Duration:** {data['duration_s'] // 60} min")
+    lines.append(f"**Avg Power (AP):** {data['avg_power']:.0f} W")
+    lines.append(f"**Normalized Power (NP):** {data['normalized_power']:.0f} W\n")
+    lines.append("### Best mean-max power")
+    lines.append("| Duration | Best Watts |")
+    lines.append("|---|---|")
+    for p in data.get("points", []):
+        d = p["duration_s"]
+        if d < 60:
+            label = f"{d}s"
+        elif d < 3600:
+            label = f"{d // 60}m"
+        else:
+            label = f"{d // 3600}h"
+        lines.append(f"| {label} | {p['best_watts']:.0f} W |")
+    omitted = data.get("omitted", [])
+    if omitted:
+        lines.append("")
+        lines.append(
+            "**Omitted (longer than activity):** "
+            + ", ".join(f"{o['duration_s']}s" for o in omitted)
+        )
+    return "\n".join(lines)
+
+
+def format_cardiac_drift(data: dict, activity_id: int) -> str:
+    """Format cardiac drift analysis as markdown."""
+    if data.get("error") == "activity_too_short":
+        mins = data.get("minimum_s", 1200) // 60
+        return (
+            f"## Cardiac Drift (Activity {activity_id})\n\n"
+            f"Activity too short for meaningful drift analysis (minimum {mins} min)."
+        )
+    if data.get("error") == "missing_required_stream":
+        return (
+            f"## Cardiac Drift (Activity {activity_id})\n\n"
+            f"Missing required stream: **{data['required']}**."
+        )
+    lines = [f"## Cardiac Drift (Activity {activity_id})\n"]
+    lines.append(f"**Duration:** {data['duration_s'] // 60} min\n")
+    s1, s2 = data["first_half"], data["second_half"]
+
+    def _power_cell(seg: dict) -> str:
+        if seg["avg_power"] is None:
+            return "N/A (no power)"
+        return f"{seg['avg_power']:.0f} W (NP {seg['np']:.0f})"
+
+    lines.append("| Half | Avg HR | Power |")
+    lines.append("|---|---|---|")
+    lines.append(f"| 1st | {s1['avg_hr']:.0f} | {_power_cell(s1)} |")
+    lines.append(f"| 2nd | {s2['avg_hr']:.0f} | {_power_cell(s2)} |")
+    lines.append("")
+    lines.append(f"**HR drift:** {data['hr_drift_pct']:+.2f}%")
+    if data.get("decoupling_pct") is not None:
+        lines.append(f"**Pa:HR decoupling:** {data['decoupling_pct']:+.2f}%")
+        if data["threshold_5pct_exceeded"]:
+            lines.append("Exceeded 5% threshold.")
+    lines.append("")
+    lines.append(f"_{data.get('methodology', '')}_")
     return "\n".join(lines)
