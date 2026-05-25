@@ -89,6 +89,46 @@ class CacheDB:
                 total_synced INTEGER DEFAULT 0,
                 mode TEXT
             );
+
+            -- Training-load: per-field history of physiological inputs.
+            -- One table keyed by field_name (not three sibling tables) so new
+            -- fields can be added without migrations. effective_to NULL means
+            -- "still in effect". Lookups use the composite index for fast
+            -- date-bounded resolution.
+            CREATE TABLE IF NOT EXISTS athlete_config_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                field_name TEXT NOT NULL CHECK (
+                    field_name IN ('ftp_watts', 'lthr_bpm', 'weight_kg')
+                ),
+                value REAL NOT NULL,
+                effective_from TEXT NOT NULL,
+                effective_to TEXT,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_athlete_config_lookup
+                ON athlete_config_history(user_id, field_name, effective_from DESC);
+
+            -- Training-load: per-activity TSS/NP/IF cache keyed by inputs_hash
+            -- so retroactive FTP changes produce new rows alongside the old
+            -- ones (audit trail) rather than overwriting.
+            CREATE TABLE IF NOT EXISTS activity_load (
+                activity_id INTEGER NOT NULL,
+                inputs_hash TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                tss REAL,
+                np_watts REAL,
+                intensity_factor REAL,
+                method TEXT NOT NULL CHECK (method IN ('power', 'hr', 'none')),
+                inputs_used TEXT NOT NULL,
+                warnings TEXT NOT NULL,
+                computed_at REAL NOT NULL,
+                PRIMARY KEY (activity_id, inputs_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_load_date
+                ON activity_load(user_id, date);
         """)
         await self._db.commit()
 

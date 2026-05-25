@@ -17,6 +17,7 @@ from strava_mcp_vault.cache.geocode import forward_geocode, reverse_geocode_many
 from strava_mcp_vault.cache.manager import CacheManager
 from strava_mcp_vault.clients.strava import StravaClient
 from strava_mcp_vault.exceptions import RateLimitError, StravaAPIError, VaultError
+from strava_mcp_vault.training_load import config as tl_config
 from strava_mcp_vault.formatters import (
     format_activities_near,
     format_activity_detail,
@@ -959,6 +960,352 @@ async def health_check(response_format: Literal["json", "markdown"] = "markdown"
             f"long {lng['usage']}/{lng['limit']}"
         )
     return "\n".join(lines)
+
+
+# ── Training-load: athlete configuration (Phase 1) ─────────────────────
+#
+# user_id is the real Strava athlete_id (resolved at tool-call time from
+# the cached /athlete profile). Single-tenant in practice, but the DB
+# already keys rows by user_id so future multi-tenant deployments need no
+# schema change. Date inputs are ISO YYYY-MM-DD; the resolver uses string
+# comparison, which is correct for ISO dates.
+
+
+async def _user_id() -> int:
+    """Return the current Strava athlete_id. Cached via manager (24h TTL)."""
+    profile = await manager.get_athlete_profile()
+    return int(profile["id"])
+
+
+def _today_iso() -> str:
+    from datetime import date
+    return date.today().isoformat()
+
+
+def _format_config(cfg: dict, as_of: str) -> str:
+    lines = [f"## 🏋️  Athlete Config (effective {as_of})", ""]
+    pairs = [
+        ("FTP", cfg["ftp_watts"], cfg["ftp_effective_from"], "W"),
+        ("LTHR", cfg["lthr_bpm"], cfg["lthr_effective_from"], "bpm"),
+        ("Weight", cfg["weight_kg"], cfg["weight_effective_from"], "kg"),
+    ]
+    for label, value, eff_from, unit in pairs:
+        if value is None:
+            lines.append(f"- **{label}:** — *(no value set)*")
+        else:
+            lines.append(f"- **{label}:** {value:g} {unit} *(since {eff_from})*")
+    return "\n".join(lines)
+
+
+def _format_history(field_name: str, rows: list[dict]) -> str:
+    if not rows:
+        return f"## 📜 {field_name} history\n\n*(no entries)*"
+    lines = [f"## 📜 {field_name} history ({len(rows)} entries, newest first)", ""]
+    lines.append("| Value | Effective from | Effective to |")
+    lines.append("|-------|----------------|--------------|")
+    for r in rows:
+        eff_to = r["effective_to"] or "*(open)*"
+        lines.append(f"| {r['value']:g} | {r['effective_from']} | {eff_to} |")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="strava_set_athlete_ftp",
+    annotations={
+        "title": "Set FTP (functional threshold power) effective on a date",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(10)
+async def set_athlete_ftp(value: float, effective_from: str) -> str:
+    """Set FTP (functional threshold power) in watts, effective on a date.
+
+    Inputs:
+    - value: integer or float watts. Range 50–500. Rejected if outside.
+    - effective_from: ISO date (YYYY-MM-DD). Must be strictly later than the
+      current open row's effective_from — use `strava_set_athlete_ftp_historical`
+      to backfill closed windows in the past.
+
+    Behavior: closes the current open FTP row at `effective_from`, inserts a
+    new open row with `value`. Future training-load computations resolve
+    through this history so retroactive changes propagate automatically.
+    """
+    try:
+        tl_config.validate_value("ftp_watts", value)
+        await tl_config.set_field(
+            manager.db._db, await _user_id(), "ftp_watts", value, effective_from
+        )
+        return f"FTP set to {value:g} W effective {effective_from}."
+    except tl_config.ValidationError as e:
+        return f"Validation error: {e}"
+    except Exception as e:
+        return _tool_error("set_athlete_ftp", e)
+
+
+@mcp.tool(
+    name="strava_set_athlete_lthr",
+    annotations={
+        "title": "Set LTHR (lactate threshold heart rate) effective on a date",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(10)
+async def set_athlete_lthr(value: int, effective_from: str) -> str:
+    """Set LTHR (lactate threshold heart rate) in bpm, effective on a date.
+
+    Inputs:
+    - value: integer bpm. Range 100–210. Rejected if outside.
+    - effective_from: ISO date (YYYY-MM-DD). Must be strictly later than the
+      current open row's effective_from — use
+      `strava_set_athlete_lthr_historical` for backfill.
+
+    Used by HR-based TSS (hrTSS) for activities lacking a watts stream.
+    """
+    try:
+        tl_config.validate_value("lthr_bpm", value)
+        await tl_config.set_field(
+            manager.db._db, await _user_id(), "lthr_bpm", value, effective_from
+        )
+        return f"LTHR set to {value:g} bpm effective {effective_from}."
+    except tl_config.ValidationError as e:
+        return f"Validation error: {e}"
+    except Exception as e:
+        return _tool_error("set_athlete_lthr", e)
+
+
+@mcp.tool(
+    name="strava_set_athlete_weight",
+    annotations={
+        "title": "Set body weight effective on a date",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(10)
+async def set_athlete_weight(
+    value: float,
+    effective_from: str,
+    unit: Literal["kg", "lb"],
+) -> str:
+    """Set body weight, effective on a date.
+
+    Inputs:
+    - value: numeric weight in the unit specified by `unit`.
+    - effective_from: ISO date (YYYY-MM-DD), strictly after current open row.
+      Use `strava_set_athlete_weight_historical` for backfill.
+    - unit: REQUIRED — "kg" or "lb". Ask the user if you're unsure;
+      never guess.
+
+    Stored in kg. Range check after conversion: 30–200 kg.
+    """
+    try:
+        kg_value = tl_config.to_kg(value, unit)
+        tl_config.validate_value("weight_kg", kg_value)
+        await tl_config.set_field(
+            manager.db._db, await _user_id(), "weight_kg", kg_value, effective_from
+        )
+        return f"Weight set to {kg_value:.2f} kg effective {effective_from}."
+    except tl_config.ValidationError as e:
+        return f"Validation error: {e}"
+    except Exception as e:
+        return _tool_error("set_athlete_weight", e)
+
+
+@mcp.tool(
+    name="strava_set_athlete_ftp_historical",
+    annotations={
+        "title": "Backfill a closed historical FTP window",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(10)
+async def set_athlete_ftp_historical(
+    value: float, effective_from: str, effective_to: str
+) -> str:
+    """Insert a closed historical FTP window for dates that pre-date your
+    use of this MCP (or fill a gap between existing rows).
+
+    Inputs:
+    - value: integer watts. Range 50–500.
+    - effective_from: ISO date (YYYY-MM-DD), inclusive.
+    - effective_to: ISO date (YYYY-MM-DD), exclusive. Must be strictly
+      after effective_from.
+
+    The window [effective_from, effective_to) must not overlap any existing
+    row for FTP. If you need to splice into an existing window, modify the
+    existing row first. Use this to record FTP history that predates your
+    use of this server (e.g. "I had 240W from Jan–Jun 2024, then 260W").
+    """
+    try:
+        tl_config.validate_value("ftp_watts", value)
+        await tl_config.set_field_historical(
+            manager.db._db, await _user_id(), "ftp_watts",
+            value, effective_from, effective_to,
+        )
+        return (
+            f"FTP set to {value:g} W for [{effective_from}, {effective_to})."
+        )
+    except tl_config.ValidationError as e:
+        return f"Validation error: {e}"
+    except Exception as e:
+        return _tool_error("set_athlete_ftp_historical", e)
+
+
+@mcp.tool(
+    name="strava_set_athlete_lthr_historical",
+    annotations={
+        "title": "Backfill a closed historical LTHR window",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(10)
+async def set_athlete_lthr_historical(
+    value: int, effective_from: str, effective_to: str
+) -> str:
+    """Insert a closed historical LTHR window. Same semantics as
+    `strava_set_athlete_ftp_historical`. Range 100–210 bpm.
+    """
+    try:
+        tl_config.validate_value("lthr_bpm", value)
+        await tl_config.set_field_historical(
+            manager.db._db, await _user_id(), "lthr_bpm",
+            value, effective_from, effective_to,
+        )
+        return (
+            f"LTHR set to {value:g} bpm for [{effective_from}, {effective_to})."
+        )
+    except tl_config.ValidationError as e:
+        return f"Validation error: {e}"
+    except Exception as e:
+        return _tool_error("set_athlete_lthr_historical", e)
+
+
+@mcp.tool(
+    name="strava_set_athlete_weight_historical",
+    annotations={
+        "title": "Backfill a closed historical weight window",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(10)
+async def set_athlete_weight_historical(
+    value: float,
+    effective_from: str,
+    effective_to: str,
+    unit: Literal["kg", "lb"],
+) -> str:
+    """Insert a closed historical weight window. Same semantics as
+    `strava_set_athlete_ftp_historical`. `unit` is REQUIRED — ask the user
+    if you're unsure. Stored in kg, range 30–200 kg after conversion.
+    """
+    try:
+        kg_value = tl_config.to_kg(value, unit)
+        tl_config.validate_value("weight_kg", kg_value)
+        await tl_config.set_field_historical(
+            manager.db._db, await _user_id(), "weight_kg",
+            kg_value, effective_from, effective_to,
+        )
+        return (
+            f"Weight set to {kg_value:.2f} kg for "
+            f"[{effective_from}, {effective_to})."
+        )
+    except tl_config.ValidationError as e:
+        return f"Validation error: {e}"
+    except Exception as e:
+        return _tool_error("set_athlete_weight_historical", e)
+
+
+@mcp.tool(
+    name="strava_get_athlete_config",
+    annotations={
+        "title": "Get athlete config (FTP, LTHR, weight) as of a date",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(10)
+async def get_athlete_config(
+    date: str | None = None,
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Resolve effective FTP, LTHR, and weight as of a date.
+
+    Inputs:
+    - date: ISO date (YYYY-MM-DD). Defaults to today.
+    - response_format: "markdown" (default) or "json".
+
+    Returns each field's value and the `effective_from` date of the row
+    that supplied it. Fields with no covering row return null — no
+    defaults are ever substituted. Use `strava_get_athlete_config_history`
+    to see the full audit trail for one field.
+
+    No caching: this is a single DB read.
+    """
+    try:
+        as_of = date or _today_iso()
+        cfg = await tl_config.get_config_at(manager.db._db, await _user_id(), as_of)
+        if response_format == "json":
+            return _jsonify({"as_of": as_of, **cfg})
+        return _format_config(cfg, as_of)
+    except Exception as e:
+        return _tool_error("get_athlete_config", e)
+
+
+@mcp.tool(
+    name="strava_get_athlete_config_history",
+    annotations={
+        "title": "List full history for one config field (FTP/LTHR/weight)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(10)
+async def get_athlete_config_history(
+    field_name: Literal["ftp_watts", "lthr_bpm", "weight_kg"],
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Return the full history of one config field, newest first.
+
+    Inputs:
+    - field_name: "ftp_watts", "lthr_bpm", or "weight_kg".
+    - response_format: "markdown" (default) or "json".
+
+    Each entry contains value, effective_from, effective_to (null = currently
+    open), and created_at. Use this to audit why a past TSS computation used
+    a particular FTP value.
+    """
+    try:
+        rows = await tl_config.get_history(
+            manager.db._db, await _user_id(), field_name
+        )
+        if response_format == "json":
+            return _jsonify({"field_name": field_name, "entries": rows})
+        return _format_history(field_name, rows)
+    except tl_config.ValidationError as e:
+        return f"Validation error: {e}"
+    except Exception as e:
+        return _tool_error("get_athlete_config_history", e)
 
 
 def main() -> None:
