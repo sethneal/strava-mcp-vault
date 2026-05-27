@@ -18,6 +18,7 @@ from strava_mcp_vault.cache.manager import CacheManager
 from strava_mcp_vault.clients.strava import StravaClient
 from strava_mcp_vault.exceptions import RateLimitError, StravaAPIError, VaultError
 from strava_mcp_vault.training_load import config as tl_config
+from strava_mcp_vault.training_load import load as tl_load
 from strava_mcp_vault.formatters import (
     format_activities_near,
     format_activity_detail,
@@ -1306,6 +1307,88 @@ async def get_athlete_config_history(
         return f"Validation error: {e}"
     except Exception as e:
         return _tool_error("get_athlete_config_history", e)
+
+
+# ── Training-load: per-activity TSS / NP / IF (Phase 2) ────────────────
+
+
+def _format_load_result(r: dict) -> str:
+    """Markdown rendering of compute_activity_load output."""
+    method_emoji = {"power": "⚡", "hr": "❤️", "none": "⚠️"}.get(r["method"], "•")
+    lines = [
+        f"## {method_emoji} Activity {r['activity_id']} load — method: {r['method']}",
+        "",
+        f"- **Date:** {r['date']}",
+        f"- **Duration:** {r['duration_seconds']}s "
+        f"({r['duration_seconds'] // 60} min)",
+    ]
+    if r["tss"] is not None:
+        lines.append(f"- **TSS:** {r['tss']:.1f}")
+        lines.append(f"- **IF:** {r['intensity_factor']:.3f}")
+    if r["np_watts"] is not None:
+        lines.append(f"- **NP:** {r['np_watts']:.0f} W")
+    if r["inputs_used"]:
+        lines.append("")
+        lines.append("**Inputs used:**")
+        for k, v in r["inputs_used"].items():
+            lines.append(f"- `{k}`: {v}")
+    if r["warnings"]:
+        lines.append("")
+        lines.append("**Warnings:**")
+        for w in r["warnings"]:
+            lines.append(f"- {w}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="strava_compute_activity_load",
+    annotations={
+        "title": "Compute TSS / NP / IF for one activity",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@_with_timeout(90)
+async def compute_activity_load(
+    activity_id: int,
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Compute training-load metrics for one Strava activity.
+
+    Picks the best available method given activity data + athlete config
+    at the activity's date:
+
+    1. ``power`` — needs a watts stream AND an FTP value effective on the
+       activity date. Computes Coggan NP (with spec-compliant gap handling
+       — interpolates gaps <10s, excludes gaps ≥10s, warns at >5% gap),
+       then ``IF = NP / FTP`` and ``TSS = (sec * NP * IF) / (FTP * 3600) * 100``.
+    2. ``hr`` — needs activity.has_heartrate, average_heartrate, AND an
+       LTHR value at the activity date. ``IF = avg_hr / LTHR``,
+       ``TSS = (sec * IF^2 * 100) / 3600`` (TrainingPeaks hrTSS).
+    3. ``none`` — neither method applicable. Numeric fields are null;
+       ``warnings`` lists what's missing.
+
+    Returns the inputs_used (with effective_from dates) so you can audit
+    why a particular FTP / LTHR was applied. Result is cached by
+    ``(activity_id, inputs_hash)`` — changing FTP or LTHR for a past date
+    produces a NEW cache row alongside the old one (audit trail).
+
+    Does NOT use Strava's ``weighted_average_watts`` scalar as NP — if
+    the watts stream is unavailable, we fall through to HR or none rather
+    than borrow a value computed by a different method.
+    """
+    try:
+        user_id = await _user_id()
+        result = await tl_load.compute_activity_load(
+            manager.db._db, manager, activity_id, user_id
+        )
+        if response_format == "json":
+            return _jsonify(result)
+        return _format_load_result(result)
+    except Exception as e:
+        return _tool_error("compute_activity_load", e)
 
 
 def main() -> None:
