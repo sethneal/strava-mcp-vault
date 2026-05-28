@@ -1391,6 +1391,183 @@ async def compute_activity_load(
         return _tool_error("compute_activity_load", e)
 
 
+# ── Training-load: time-series (Phase 3) ───────────────────────────────
+
+
+def _format_fitness_curve(series: list[dict]) -> str:
+    if not series:
+        return "## 📈 Fitness Curve\n\n*(no days in range)*"
+    lines = [
+        f"## 📈 Fitness Curve ({len(series)} days)",
+        "",
+        f"From {series[0]['date']} to {series[-1]['date']}",
+        "",
+        "| Date | TSS | CTL | ATL | TSB | # |",
+        "|------|----:|----:|----:|----:|--:|",
+    ]
+    for d in series:
+        lines.append(
+            f"| {d['date']} | {d['tss']:.0f} | {d['ctl']:.1f} | "
+            f"{d['atl']:.1f} | {d['tsb']:+.1f} | {d['activity_count']} |"
+        )
+    return "\n".join(lines)
+
+
+def _format_today(payload: dict) -> str:
+    lines = [
+        f"## 🎯 Training Load — {payload['date']}",
+        "",
+        f"- **TSS today:** {payload['tss']:.0f} "
+        f"({payload['activity_count']} activities)",
+        f"- **CTL (fitness):** {payload['ctl']:.1f}",
+        f"- **ATL (fatigue):** {payload['atl']:.1f}",
+        f"- **TSB (form):** {payload['tsb']:+.1f}",
+    ]
+    forecast_key = f"forecast_{payload['forecast_days']}_day"
+    if payload.get(forecast_key):
+        last_fc = payload[forecast_key][-1]
+        lines.append("")
+        lines.append(
+            f"**If you rest {payload['forecast_days']} days:** "
+            f"CTL→{last_fc['ctl']:.1f}, ATL→{last_fc['atl']:.1f}, "
+            f"TSB→{last_fc['tsb']:+.1f}"
+        )
+    return "\n".join(lines)
+
+
+def _format_summary(s: dict) -> str:
+    return "\n".join([
+        f"## 📊 Load Summary — {s['period']} ({s['start_date']} → {s['end_date']})",
+        "",
+        f"- **Total TSS:** {s['total_tss']:.0f}",
+        f"- **Avg TSS/day:** {s['avg_tss_per_day']:.1f}",
+        f"- **Activities:** {s['total_activities']} over {s['days']} days",
+        f"- **CTL change:** {s['ctl_start']:.1f} → {s['ctl_end']:.1f} "
+        f"({s['ctl_change']:+.1f})",
+        f"- **Peak ATL:** {s['peak_atl']:.1f} on {s['peak_atl_date']}",
+    ])
+
+
+@mcp.tool(
+    name="strava_compute_fitness_curve",
+    annotations={
+        "title": "Daily CTL / ATL / TSB series for a date range",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@_with_timeout(300)
+async def compute_fitness_curve(
+    start_date: str,
+    end_date: str,
+    warmup_days: int = 180,
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Daily fitness (CTL), fatigue (ATL), and form (TSB) for a date range.
+
+    Walks every vault activity in ``[start_date - warmup_days, end_date]``,
+    computes load per activity (uses the activity_load cache), aggregates
+    per-day TSS, runs EWMA, returns only days in the requested range.
+
+    Inputs:
+    - start_date / end_date: ISO YYYY-MM-DD (both inclusive).
+    - warmup_days: prepend this many days before start so CTL/ATL
+      converge from zero seed. Default 180 (>4 time constants, ~98%
+      converged). Use 0 for cold-start testing.
+
+    First call may take a while (every activity in the window needs a
+    load computation, which for power-method activities fetches the watts
+    stream from Strava). Subsequent calls hit the cache and are fast.
+    Per-tool timeout: 300s.
+
+    TSB convention: ``CTL[d-1] - ATL[d-1]`` ("form" coming into today).
+    """
+    try:
+        user_id = await _user_id()
+        series = await tl_load.compute_fitness_curve(
+            manager.db._db, manager, user_id,
+            start_date, end_date, warmup_days,
+        )
+        if response_format == "json":
+            return _jsonify(series)
+        return _format_fitness_curve(series)
+    except Exception as e:
+        return _tool_error("compute_fitness_curve", e)
+
+
+@mcp.tool(
+    name="strava_get_training_load_today",
+    annotations={
+        "title": "Today's CTL / ATL / TSB + 7-day rest forecast",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@_with_timeout(120)
+async def get_training_load_today(
+    forecast_days: int = 7,
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Today's fitness state plus an N-day rest projection.
+
+    Returns today's TSS / CTL / ATL / TSB plus ``forecast_N_day`` showing
+    where CTL / ATL / TSB land if you do zero training for the next N
+    days. Useful for "should I rest this week?" calls.
+
+    Uses 180-day warmup. First call may be slow if many activities are
+    uncached; subsequent calls fast.
+    """
+    try:
+        user_id = await _user_id()
+        result = await tl_load.get_training_load_today(
+            manager.db._db, manager, user_id, forecast_days=forecast_days,
+        )
+        if response_format == "json":
+            return _jsonify(result)
+        return _format_today(result)
+    except Exception as e:
+        return _tool_error("get_training_load_today", e)
+
+
+@mcp.tool(
+    name="strava_get_load_summary",
+    annotations={
+        "title": "Period totals + peak ATL + CTL change",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@_with_timeout(120)
+async def get_load_summary(
+    period: Literal["week", "month", "year"] = "week",
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Aggregate training load over the last week / month / year.
+
+    Returns total TSS, average TSS/day, total activity count, CTL at
+    start vs end (and delta), peak ATL with its date. End date is today.
+
+    Periods: ``week`` (7 days), ``month`` (30), ``year`` (365). First
+    call for ``year`` may be slow on a large vault.
+    """
+    try:
+        user_id = await _user_id()
+        result = await tl_load.get_load_summary(
+            manager.db._db, manager, user_id, period=period,
+        )
+        if response_format == "json":
+            return _jsonify(result)
+        return _format_summary(result)
+    except Exception as e:
+        return _tool_error("get_load_summary", e)
+
+
 def main() -> None:
     import uvicorn
 

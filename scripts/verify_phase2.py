@@ -1,11 +1,13 @@
-"""One-shot end-to-end verification for Phase 2.
+"""One-shot end-to-end verification for Phases 2+3.
 
-Seeds FTP=260 effective from 2024-01-01 (covers all of Seth's recent rides),
-then runs compute_activity_load on a target activity using the LIVE vault DB
-and a LIVE CacheManager (auth + streams from Strava as needed).
+Phase 2: compute_activity_load on a specified (or latest) activity.
+Phase 3: get_training_load_today + get_load_summary("month") + a small
+fitness curve slice for the past 30 days.
+
+Assumes FTP/LTHR/weight already seeded (verify_phase2 sets FTP=260 on
+2024-01-01 if no history exists).
 
 Run: .venv/bin/python scripts/verify_phase2.py [activity_id]
-Default activity_id is the user's most recent ride id.
 """
 
 import asyncio
@@ -59,11 +61,23 @@ async def main():
         print(f"FTP history already present ({len(history)} entries); skipping seed.")
 
     # Compute load
-    print(f"\nComputing load for activity {activity_id}...")
+    print(f"\n=== Phase 2: compute_activity_load({activity_id}) ===")
     result = await tl_load.compute_activity_load(
         db._db, manager, activity_id, user_id
     )
     print(json.dumps(result, indent=2, default=str))
+
+    print("\n=== Phase 3: get_training_load_today() ===")
+    today = await tl_load.get_training_load_today(
+        db._db, manager, user_id, forecast_days=7
+    )
+    print(json.dumps(today, indent=2, default=str))
+
+    print("\n=== Phase 3: get_load_summary('month') ===")
+    summary = await tl_load.get_load_summary(
+        db._db, manager, user_id, period="month"
+    )
+    print(json.dumps(summary, indent=2, default=str))
 
     await db.close()
     await client.close()
