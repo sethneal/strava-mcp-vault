@@ -19,6 +19,7 @@ from strava_mcp_vault.clients.strava import StravaClient
 from strava_mcp_vault.exceptions import RateLimitError, StravaAPIError, VaultError
 from strava_mcp_vault.training_load import config as tl_config
 from strava_mcp_vault.training_load import load as tl_load
+from strava_mcp_vault.training_load import strava_passthrough as tl_strava
 from strava_mcp_vault.formatters import (
     format_activities_near,
     format_activity_detail,
@@ -1566,6 +1567,113 @@ async def get_load_summary(
         return _format_summary(result)
     except Exception as e:
         return _tool_error("get_load_summary", e)
+
+
+# ── Training-load: Strava-native passthroughs (Phase 4) ────────────────
+
+
+@mcp.tool(
+    name="strava_get_strava_suffer_score",
+    annotations={
+        "title": "Strava's raw suffer_score (Relative Effort) for one activity",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@_with_timeout(30)
+async def get_strava_suffer_score(
+    activity_id: int,
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Return Strava's raw ``suffer_score`` for one activity, with no
+    computation on top.
+
+    Strava renamed this metric to "Relative Effort" in their UI but
+    kept the API field name. It's an HR-based intensity score; activities
+    without HR data have a null suffer_score and this tool surfaces that
+    explicitly rather than returning 0.
+
+    Use to sanity-check Strava's Relative Effort against this MCP's
+    computed TSS. The two won't equal each other (different methods, one
+    based purely on HR, the other on power + HR) — but they should
+    track together over time.
+    """
+    try:
+        result = await tl_strava.get_suffer_score(manager, activity_id)
+        if response_format == "json":
+            return _jsonify(result)
+        if result["suffer_score"] is None:
+            return (
+                f"## ❤️ Suffer Score — activity {activity_id}\n\n"
+                f"- **suffer_score:** null\n"
+                f"- {result['note']}"
+            )
+        return (
+            f"## ❤️ Suffer Score — activity {activity_id}\n\n"
+            f"- **suffer_score:** {result['suffer_score']:.0f}\n"
+            f"- has_heartrate: {result['has_heartrate']}"
+        )
+    except Exception as e:
+        return _tool_error("get_strava_suffer_score", e)
+
+
+@mcp.tool(
+    name="strava_get_strava_relative_effort_summary",
+    annotations={
+        "title": "Sum of Strava's suffer_score across a date range",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(60)
+async def get_strava_relative_effort_summary(
+    start_date: str,
+    end_date: str,
+    sport_type: str | None = None,
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Sum Strava's ``suffer_score`` (Relative Effort) across vault
+    activities in ``[start_date, end_date]``.
+
+    Mirrors the math behind Strava's "Weekly Relative Effort" chart.
+    Useful for sanity-checking against this MCP's TSS sum from
+    ``strava_get_load_summary`` — both should trend together even though
+    they're different metrics.
+
+    Activities with null suffer_score (no HR) are excluded from the sum
+    but counted separately so you can see how much of the period had
+    Strava's metric available.
+    """
+    try:
+        from datetime import date as _d, timedelta as _td
+        before_exclusive = (
+            _d.fromisoformat(end_date) + _td(days=1)
+        ).isoformat()
+        result = await tl_strava.sum_suffer_scores(
+            manager.db, start_date, before_exclusive, sport_type=sport_type
+        )
+        # Replace technical bounds with user-friendly date range in the
+        # returned payload for the json/markdown view.
+        result["start_date"] = start_date
+        result["end_date"] = end_date
+        del result["after"]
+        del result["before_exclusive"]
+        if response_format == "json":
+            return _jsonify(result)
+        return (
+            f"## 📊 Strava Relative Effort — "
+            f"{result['start_date']} → {result['end_date']}\n\n"
+            f"- **Total suffer_score:** {result['total_suffer_score']:.0f}\n"
+            f"- **Activities:** {result['activities_total']} "
+            f"({result['activities_with_score']} with score, "
+            f"{result['activities_without_score']} without)"
+        )
+    except Exception as e:
+        return _tool_error("get_strava_relative_effort_summary", e)
 
 
 def main() -> None:
