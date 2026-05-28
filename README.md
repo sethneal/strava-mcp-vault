@@ -72,6 +72,16 @@ For a simpler setup that just wraps the existing npm package in Docker, see [str
 | `strava_get_cardiac_drift` | First-half vs second-half HR comparison, with optional Pa:HR decoupling when power is present. Requires ≥20 min activity. | 24 hours |
 | `strava_get_hr_power_decoupling` | Pa:HR decoupling ratio between two segments. Requires both heartrate and watts streams. | 24 hours |
 | `strava_health_check` | Fast (<5s) probe of auth + DB. Returns per-probe ok/error, token TTL, and Strava rate-limit headroom. Use to detect a hung server before queuing real work. | — |
+| `strava_set_athlete_ftp` / `_lthr` / `_weight` | Set FTP, LTHR, or weight effective from a date. Forward-only — closes the current open row, opens a new one. Required for training-load tools. | — |
+| `strava_set_athlete_ftp_historical` / `_lthr_historical` / `_weight_historical` | Backfill a closed `[effective_from, effective_to)` window for historical periods that pre-date your use of this MCP. Must not overlap existing rows. | — |
+| `strava_get_athlete_config` | Resolve effective FTP / LTHR / weight as of a date (default today). Each field's value comes with the `effective_from` of the row that supplied it. | — |
+| `strava_get_athlete_config_history` | Full audit trail for one field (FTP, LTHR, or weight), newest first. | — |
+| `strava_compute_activity_load` | Compute TSS / NP / IF for one activity using Coggan power-TSS (with spec-compliant gap handling) or TrainingPeaks hrTSS as fallback. Returns the inputs used (with `effective_from` dates) so you can audit. | per-activity cache keyed by `(activity_id, inputs_hash)` |
+| `strava_compute_fitness_curve` | Daily CTL / ATL / TSB series for a date range. 180-day warmup by default for cold-start convergence. | per-activity cache hit on subsequent runs |
+| `strava_get_training_load_today` | Today's CTL / ATL / TSB plus an N-day rest forecast (default 7) showing where form lands if you do zero training. | — |
+| `strava_get_load_summary` | Period totals: TSS, avg/day, activity count, CTL change, peak ATL. `period` = `"week"` (7d), `"month"` (30d), or `"year"` (365d). | — |
+| `strava_get_strava_suffer_score` | Strava's raw `suffer_score` (Relative Effort) for one activity. Passthrough — no computation. Use to compare against this MCP's computed TSS. | — |
+| `strava_get_strava_relative_effort_summary` | Sum Strava's `suffer_score` across a date range. Mirrors Strava's "Weekly Relative Effort" chart math. | — |
 
 All read tools accept a `response_format` parameter: `"markdown"` (default) for human-readable output or `"json"` for programmatic use.
 
@@ -84,6 +94,69 @@ All read tools accept a `response_format` parameter: `"markdown"` (default) for 
 - **A lowercase category alias:** `"rides"` / `"cycling"` (all ride types), `"running"`, `"swims"`, `"walks"`, `"hikes"`, `"snow"`, `"ski"`. Aliases are case-sensitive on the lowercase form — CamelCase always stays literal.
 
 > **Known limit: surface type.** Strava's `sport_type` only distinguishes `Ride` / `GravelRide` / `MountainBikeRide` / `VirtualRide`, and Strava itself only records surface when the user manually tags an upload as `GravelRide`. If you ride a single bike on both pavement and dirt, every ride comes back as `Ride` with no surface info, so questions like "how much of my volume is road vs gravel?" can't be answered from `sport_type` alone. Workarounds: tag gravel rides on Strava, or maintain a personal gear-id → surface mapping client-side.
+
+## Training load (TSS, CTL, ATL, TSB)
+
+This MCP includes a complete Coggan / TrainingPeaks-style training-load model for cycling — per-activity TSS, plus the EWMA chronic / acute / balance (CTL / ATL / TSB) time series, plus passthroughs of Strava's own Relative Effort numbers for comparison.
+
+**The numbers will NOT match Strava's Fitness & Freshness chart.** That's intentional. Strava's UI numbers come from their proprietary algorithms (different rolling window for NP, different intensity weighting); this MCP follows the published Coggan methodology. The `strava_get_strava_*` passthrough tools exist exactly so you can compare the two and see they track together (e.g. on a real 30-day window: TSS sum 2334 vs Strava RE sum 1430 — same shape, different scale).
+
+### Methodology
+
+- **Power TSS:** standard Coggan. `NP = (mean of (30-sec rolling avg of watts)^4)^(1/4)`, `IF = NP / FTP`, `TSS = (sec × NP × IF) / (FTP × 3600) × 100`. Gap handling: stream nulls under 10 samples are linearly interpolated between flanking values; nulls of 10+ samples are excluded from the rolling window (no synthetic zeros). Activities with gap duration > 5% of total emit a warning. Minimum 30 valid samples required.
+- **HR TSS (hrTSS):** TrainingPeaks formula. `IF = avg_hr / LTHR`, `TSS = (sec × IF² × 100) / 3600`. Uses Strava's per-activity `average_heartrate` scalar, not stream re-computation.
+- **Method selection:** power when watts stream + FTP both available; else HR when avg HR + LTHR both available; else `method="none"` with warnings explaining what's missing. **The MCP does NOT borrow Strava's `weighted_average_watts` as a substitute NP** — if the watts stream is unavailable, it falls through to HR or none rather than blend in a number computed by a different algorithm.
+- **EWMA time constants:** CTL τ = 42 days, ATL τ = 7 days, `k = 1 - exp(-1/τ)`. Default 180-day warmup before any requested range so CTL/ATL converge from a zero seed (>4 time constants, ≈98% converged). The earlier "Path A" attempt used 60d (~1.4τ), which produced visible cold-start CTL inaccuracy.
+- **TSB convention:** yesterday's CTL minus yesterday's ATL ("form" coming into today, matching TrainingPeaks display).
+
+### Athlete config: physiological inputs are first-class data
+
+FTP, LTHR, and weight all change over time. The MCP applies the value that was effective on each activity's date, not today's value retroactively. Values live in `athlete_config_history` with `effective_from` / `effective_to` windows. Every computed metric returns the inputs that were resolved for it (value + `effective_from`) so when numbers look off you can see why without re-reading code.
+
+Validation: FTP 50–500 W, LTHR 100–210 bpm, weight 30–200 kg. Out-of-range values are rejected, never coerced. Weight tools require `unit="kg"` or `unit="lb"` explicitly — never guessed.
+
+**Backfill is supported via the `*_historical` tools.** If you've been on Strava for years, use `strava_set_athlete_ftp_historical(value, effective_from, effective_to)` to record your past FTP windows so TSS for old rides resolves the right value. Inserts must not overlap existing rows (modify the existing row first if you need to splice).
+
+### Caching and audit trail
+
+`strava_compute_activity_load` caches results in the `activity_load` table keyed by `(activity_id, inputs_hash)`. If you change FTP retroactively for a past date, the next compute produces a **new** cache row alongside the old one — the old result stays queryable for debugging "why did my CTL change?"
+
+First-run `compute_fitness_curve` over a 180-day window can be slow (every uncached power-method activity fetches its watts stream from Strava). Subsequent runs read from the cache and are fast.
+
+### Out of scope (intentionally)
+
+- Matching Strava's Fitness & Freshness chart values (different math, proprietary).
+- FTP auto-estimation from rides (eFTP / pFTP).
+- HRV integration.
+- Sport-specific FTP (running, swimming).
+- Power balance, torque effectiveness, or other Garmin Connect IQ metrics.
+- Strength training load modeling.
+- Subjective wellness inputs (sleep, RPE, mood).
+
+### Quickstart for training-load tools
+
+```
+# 1. Seed your physiological config (you only do this once, plus updates)
+strava_set_athlete_ftp(value=260, effective_from="2024-01-01")
+strava_set_athlete_lthr(value=171, effective_from="2024-01-01")
+strava_set_athlete_weight(value=245, effective_from="2024-01-01", unit="lb")
+
+# (optional) backfill past values
+strava_set_athlete_ftp_historical(value=240, effective_from="2022-01-01", effective_to="2024-01-01")
+
+# 2. Sync activities into the vault if you haven't yet
+strava_sync_activities()
+
+# 3. Use the load tools
+strava_compute_activity_load(activity_id=18654899126)
+strava_get_training_load_today()                  # today + 7-day rest forecast
+strava_get_load_summary(period="month")           # last 30 days
+strava_compute_fitness_curve(start_date="2026-05-01", end_date="2026-05-27")
+
+# 4. Compare to Strava's own numbers
+strava_get_strava_suffer_score(activity_id=18654899126)
+strava_get_strava_relative_effort_summary(start_date="2026-05-01", end_date="2026-05-27")
+```
 
 ## Working with stream data
 
