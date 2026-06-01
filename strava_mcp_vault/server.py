@@ -1310,6 +1310,122 @@ async def get_athlete_config_history(
         return _tool_error("get_athlete_config_history", e)
 
 
+@mcp.tool(
+    name="strava_delete_athlete_config_row",
+    annotations={
+        "title": "Delete one athlete-config row (FTP/LTHR/weight)",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(10)
+async def delete_athlete_config_row(
+    field_name: Literal["ftp_watts", "lthr_bpm", "weight_kg"],
+    effective_from: str,
+) -> str:
+    """Delete a single manually-entered config row by its identity.
+
+    Inputs:
+    - field_name: "ftp_watts", "lthr_bpm", or "weight_kg".
+    - effective_from: ISO date (YYYY-MM-DD) of the row to delete. This is the
+      start date shown by `strava_get_athlete_config_history`.
+
+    Deleting a row may leave a gap in the timeline — that is allowed; the
+    resolver returns null for uncovered dates. To close a gap, extend a
+    neighbouring row with `strava_edit_athlete_config_row`. Only the manually
+    entered config tables are editable; Strava activity data is read-only.
+    """
+    try:
+        deleted = await tl_config.delete_field_row(
+            manager.db._db, await _user_id(), field_name, effective_from
+        )
+        unit = {"ftp_watts": "W", "lthr_bpm": "bpm", "weight_kg": "kg"}[field_name]
+        to_str = deleted["effective_to"] or "open"
+        return (
+            f"Deleted {field_name} = {deleted['value']:g} {unit} effective "
+            f"{effective_from} (was [{effective_from}, {to_str})). Re-add with the "
+            f"matching strava_set_athlete_*_historical tool if this was a mistake."
+        )
+    except tl_config.ValidationError as e:
+        return f"Validation error: {e}"
+    except Exception as e:
+        return _tool_error("delete_athlete_config_row", e)
+
+
+@mcp.tool(
+    name="strava_edit_athlete_config_row",
+    annotations={
+        "title": "Edit one athlete-config row's value and/or dates",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+@_with_timeout(10)
+async def edit_athlete_config_row(
+    field_name: Literal["ftp_watts", "lthr_bpm", "weight_kg"],
+    effective_from: str,
+    new_value: float | None = None,
+    new_unit: Literal["kg", "lb"] | None = None,
+    new_effective_from: str | None = None,
+    new_effective_to: str | None = None,
+) -> str:
+    """Edit a single manually-entered config row, fixing a mistaken entry.
+
+    Locate the row by (field_name, effective_from); change only what you pass.
+    Inputs:
+    - field_name: "ftp_watts", "lthr_bpm", or "weight_kg".
+    - effective_from: ISO date of the row to edit (its current start date).
+    - new_value: optional new value. For weight, `new_unit` is REQUIRED.
+      Range-checked (FTP 50-500 W, LTHR 100-210 bpm, weight 30-200 kg).
+    - new_unit: "kg" or "lb" — required only when editing a weight value.
+    - new_effective_from: optional new start date (ISO).
+    - new_effective_to: optional new end date (ISO). Pass the literal "open"
+      to clear the end date (make the row current/open). Omitting it or
+      passing null both leave the end date unchanged — only "open" clears it.
+
+    Re-validates against neighbouring rows: no overlapping windows, at most
+    one open row per field. Rejected edits leave the database untouched.
+    """
+    try:
+        value_arg = new_value
+        if new_value is not None and field_name == "weight_kg":
+            if new_unit is None:
+                return (
+                    "Validation error: new_unit is required when editing a "
+                    "weight value — pass 'kg' or 'lb'."
+                )
+            value_arg = tl_config.to_kg(new_value, new_unit)
+
+        if new_effective_to is None:
+            to_arg: object = tl_config.UNSET
+        elif new_effective_to == "open":
+            to_arg = None
+        else:
+            to_arg = new_effective_to
+
+        result = await tl_config.edit_field_row(
+            manager.db._db, await _user_id(), field_name, effective_from,
+            new_value=value_arg, new_effective_from=new_effective_from,
+            new_effective_to=to_arg,
+        )
+        before, after = result["before"], result["after"]
+        b_to = before["effective_to"] or "open"
+        a_to = after["effective_to"] or "open"
+        return (
+            f"Edited {field_name}: "
+            f"[{before['effective_from']}, {b_to}) value {before['value']:g} → "
+            f"[{after['effective_from']}, {a_to}) value {after['value']:g}."
+        )
+    except tl_config.ValidationError as e:
+        return f"Validation error: {e}"
+    except Exception as e:
+        return _tool_error("edit_athlete_config_row", e)
+
+
 # ── Training-load: per-activity TSS / NP / IF (Phase 2) ────────────────
 
 

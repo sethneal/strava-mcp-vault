@@ -362,3 +362,277 @@ async def test_historical_abuts_closed_row_no_overlap(conn):
     )
     boundary = await config.get_config_at(conn, USER_ID, "2024-06-01")
     assert boundary["ftp_watts"] == 250
+
+
+# ── delete_field_row ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_row_and_returns_it(conn):
+    """Delete an existing row → gone from history, returns its values."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2024-06-01"
+    )
+    deleted = await config.delete_field_row(
+        conn, USER_ID, "ftp_watts", "2024-01-01"
+    )
+    assert deleted == {
+        "field_name": "ftp_watts",
+        "value": 240,
+        "effective_from": "2024-01-01",
+        "effective_to": "2024-06-01",
+    }
+    assert await config.get_history(conn, USER_ID, "ftp_watts") == []
+
+
+@pytest.mark.asyncio
+async def test_delete_open_row(conn):
+    """Deleting the open row leaves the remaining timeline intact."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2025-01-01"
+    )
+    await config.set_field(conn, USER_ID, "ftp_watts", 260, "2025-01-01")
+    await config.delete_field_row(conn, USER_ID, "ftp_watts", "2025-01-01")
+    hist = await config.get_history(conn, USER_ID, "ftp_watts")
+    assert len(hist) == 1
+    assert hist[0]["effective_from"] == "2024-01-01"
+
+
+@pytest.mark.asyncio
+async def test_delete_leaves_gap_resolver_returns_none(conn):
+    """A delete may open a gap; resolver returns None for uncovered dates."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2024-06-01"
+    )
+    await config.delete_field_row(conn, USER_ID, "ftp_watts", "2024-01-01")
+    assert (await config.get_config_at(conn, USER_ID, "2024-03-01"))[
+        "ftp_watts"
+    ] is None
+
+
+@pytest.mark.asyncio
+async def test_delete_missing_row_raises(conn):
+    """No row at (field, effective_from) → ValidationError."""
+    with pytest.raises(config.ValidationError, match="no ftp_watts row"):
+        await config.delete_field_row(conn, USER_ID, "ftp_watts", "2099-01-01")
+
+
+@pytest.mark.asyncio
+async def test_delete_unknown_field_raises(conn):
+    """An unrecognized field_name → ValidationError before any DB access."""
+    with pytest.raises(config.ValidationError, match="field_name"):
+        await config.delete_field_row(conn, USER_ID, "vo2max", "2024-01-01")
+
+
+# ── edit_field_row ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_edit_value_only(conn):
+    """Change value, leave dates untouched."""
+    await config.set_field(conn, USER_ID, "ftp_watts", 240, "2024-01-01")
+    result = await config.edit_field_row(
+        conn, USER_ID, "ftp_watts", "2024-01-01", new_value=255
+    )
+    assert result["after"]["value"] == 255
+    assert result["after"]["effective_from"] == "2024-01-01"
+    assert result["after"]["effective_to"] is None
+    assert (await config.get_config_at(conn, USER_ID, "2024-06-01"))[
+        "ftp_watts"
+    ] == 255
+
+
+@pytest.mark.asyncio
+async def test_edit_value_out_of_range_raises(conn):
+    await config.set_field(conn, USER_ID, "ftp_watts", 240, "2024-01-01")
+    with pytest.raises(config.ValidationError, match="out of range"):
+        await config.edit_field_row(
+            conn, USER_ID, "ftp_watts", "2024-01-01", new_value=9000
+        )
+
+
+@pytest.mark.asyncio
+async def test_edit_extend_effective_to_over_gap(conn):
+    """Extend a closed row's end date to cover a gap — no overlap, succeeds."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2024-06-01"
+    )
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 260, "2024-07-01", "2024-12-01"
+    )
+    # gap is [2024-06-01, 2024-07-01); extend first window to close it
+    await config.edit_field_row(
+        conn, USER_ID, "ftp_watts", "2024-01-01", new_effective_to="2024-07-01"
+    )
+    assert (await config.get_config_at(conn, USER_ID, "2024-06-15"))[
+        "ftp_watts"
+    ] == 240
+
+
+@pytest.mark.asyncio
+async def test_edit_creating_overlap_raises(conn):
+    """An edit that makes the row overlap another → ValidationError (self excluded)."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2024-06-01"
+    )
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 260, "2024-07-01", "2024-12-01"
+    )
+    with pytest.raises(config.ValidationError, match="overlap"):
+        await config.edit_field_row(
+            conn, USER_ID, "ftp_watts", "2024-01-01", new_effective_to="2024-08-01"
+        )
+
+
+@pytest.mark.asyncio
+async def test_edit_to_open_when_another_open_exists_raises(conn):
+    """Setting effective_to to open while another open row exists → rejected."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2025-01-01"
+    )
+    await config.set_field(conn, USER_ID, "ftp_watts", 260, "2025-01-01")
+    with pytest.raises(config.ValidationError, match="open"):
+        await config.edit_field_row(
+            conn, USER_ID, "ftp_watts", "2024-01-01", new_effective_to=None
+        )
+
+
+@pytest.mark.asyncio
+async def test_edit_to_open_when_none_open_succeeds(conn):
+    """Opening a closed row when no other row is open → succeeds."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2025-01-01"
+    )
+    await config.edit_field_row(
+        conn, USER_ID, "ftp_watts", "2024-01-01", new_effective_to=None
+    )
+    hist = await config.get_history(conn, USER_ID, "ftp_watts")
+    assert hist[0]["effective_to"] is None
+
+
+@pytest.mark.asyncio
+async def test_edit_reversed_window_raises(conn):
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2024-06-01"
+    )
+    with pytest.raises(config.ValidationError, match="strictly before"):
+        await config.edit_field_row(
+            conn, USER_ID, "ftp_watts", "2024-01-01",
+            new_effective_from="2024-07-01", new_effective_to="2024-03-01",
+        )
+
+
+@pytest.mark.asyncio
+async def test_edit_missing_row_raises(conn):
+    with pytest.raises(config.ValidationError, match="no ftp_watts row"):
+        await config.edit_field_row(
+            conn, USER_ID, "ftp_watts", "2099-01-01", new_value=200
+        )
+
+
+@pytest.mark.asyncio
+async def test_edit_unchanged_keeps_value(conn):
+    """new_effective_to omitted (UNSET) leaves the end date as-is."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2024-06-01"
+    )
+    result = await config.edit_field_row(
+        conn, USER_ID, "ftp_watts", "2024-01-01", new_value=250
+    )
+    assert result["after"]["effective_to"] == "2024-06-01"
+
+
+@pytest.mark.asyncio
+async def test_edit_multi_user_isolation(conn):
+    """Editing user 1's row never touches user 2's identically-dated row."""
+    await config.set_field(conn, USER_ID, "ftp_watts", 240, "2024-01-01")
+    await config.set_field(conn, 2, "ftp_watts", 300, "2024-01-01")
+    await config.edit_field_row(conn, USER_ID, "ftp_watts", "2024-01-01", new_value=250)
+    assert (await config.get_config_at(conn, 2, "2024-06-01"))["ftp_watts"] == 300
+
+
+@pytest.mark.asyncio
+async def test_edit_shift_effective_from_into_neighbor_raises(conn):
+    """Overlap via the start date: shifting effective_from back into an
+    earlier window → ValidationError (the overlap-via-from path)."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2024-06-01"
+    )
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 260, "2024-07-01", "2024-12-01"
+    )
+    # Move the second window's start back into the first window.
+    with pytest.raises(config.ValidationError, match="overlap"):
+        await config.edit_field_row(
+            conn, USER_ID, "ftp_watts", "2024-07-01",
+            new_effective_from="2024-05-01",
+        )
+
+
+@pytest.mark.asyncio
+async def test_edit_to_open_overlapping_open_row_raises(conn):
+    """Opening a closed row whose window also overlaps an existing open row →
+    rejected by the overlap check before the single-open check runs."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2024-06-01"
+    )
+    await config.set_field(conn, USER_ID, "ftp_watts", 260, "2025-01-01")
+    # Open the earlier closed row → [2024-01-01, ∞) overlaps the open row.
+    with pytest.raises(config.ValidationError, match="overlap"):
+        await config.edit_field_row(
+            conn, USER_ID, "ftp_watts", "2024-01-01", new_effective_to=None
+        )
+
+
+# ── Acceptance fixture: the real weight_kg bug ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_acceptance_fix_stray_weight_row(conn):
+    """Reproduce and fix the real bug: a stray weight row left a 6-day
+    fragment that no tool could touch. After delete + extend-neighbour the
+    timeline is gapless, non-overlapping, with a single open row.
+
+    Seed (kg):
+      138.8  [2020-01-01, 2024-01-01)   (306 lb window)
+      111.13 [2024-01-01, 2024-01-07)   (stray, the bug)
+      125.2  [2024-01-07, open)         (276 lb, current)
+    """
+    await config.set_field_historical(
+        conn, USER_ID, "weight_kg", 138.8, "2020-01-01", "2024-01-01"
+    )
+    await config.set_field_historical(
+        conn, USER_ID, "weight_kg", 111.13, "2024-01-01", "2024-01-07"
+    )
+    await config.set_field(conn, USER_ID, "weight_kg", 125.2, "2024-01-07")
+
+    # 1. Delete the stray row → opens gap [2024-01-01, 2024-01-07).
+    deleted = await config.delete_field_row(
+        conn, USER_ID, "weight_kg", "2024-01-01"
+    )
+    assert deleted["value"] == 111.13
+    assert (await config.get_config_at(conn, USER_ID, "2024-01-03"))[
+        "weight_kg"
+    ] is None  # gap exists before stitching
+
+    # 2. Extend the 306-lb window over the gap.
+    await config.edit_field_row(
+        conn, USER_ID, "weight_kg", "2020-01-01", new_effective_to="2024-01-07"
+    )
+
+    # 3. Assert clean timeline.
+    hist = await config.get_history(conn, USER_ID, "weight_kg")
+    assert len(hist) == 2  # stray gone
+    open_rows = [r for r in hist if r["effective_to"] is None]
+    assert len(open_rows) == 1  # exactly one open row
+    assert open_rows[0]["value"] == 125.2
+    # gapless coverage across the whole span
+    assert (await config.get_config_at(conn, USER_ID, "2024-01-03"))[
+        "weight_kg"
+    ] == 138.8
+    assert (await config.get_config_at(conn, USER_ID, "2024-01-07"))[
+        "weight_kg"
+    ] == 125.2
+    assert (await config.get_config_at(conn, USER_ID, "2026-06-01"))[
+        "weight_kg"
+    ] == 125.2
