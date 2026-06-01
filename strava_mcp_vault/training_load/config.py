@@ -15,6 +15,10 @@ Public API
   effective_to)`` — inserts a closed historical row (backfill) that must
   not overlap with any existing row for the same field
 - ``get_history(conn, user_id, field_name)`` — full audit trail for a field
+- ``delete_field_row(conn, user_id, field_name, effective_from)`` — delete one
+  row by stable identity; may leave a gap (allowed)
+- ``edit_field_row(conn, user_id, field_name, effective_from, ...)`` — edit one
+  row's value and/or dates, re-validating overlap and single-open invariants
 - ``to_kg(value, unit)`` — trivial kg/lb conversion; unit is required at the
   tool surface so the caller (LLM or human) commits to a unit before
   reaching this layer
@@ -41,6 +45,10 @@ RANGES: dict[FieldName, tuple[float, float]] = {
 }
 
 LB_TO_KG = 0.45359237
+
+# Sentinel distinguishing "leave effective_to unchanged" from "set it to NULL
+# (make the row open)" in edit_field_row, since None is a meaningful value.
+UNSET = object()
 
 
 class ValidationError(ValueError):
@@ -313,4 +321,129 @@ async def delete_field_row(
         "value": value,
         "effective_from": effective_from,
         "effective_to": effective_to,
+    }
+
+
+# A date string guaranteed to sort after any real ISO date, used as the upper
+# bound when an edited row is open (effective_to IS NULL) so the half-open
+# overlap predicate works unchanged.
+_OPEN_UPPER_BOUND = "9999-12-31"
+
+
+async def edit_field_row(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    field_name: FieldName,
+    effective_from: str,
+    *,
+    new_value: float | None = None,
+    new_effective_from: str | None = None,
+    new_effective_to: str | None | object = UNSET,
+) -> dict[str, dict[str, float | str | None]]:
+    """Edit a single config row located by (field_name, effective_from).
+
+    Only supplied fields change:
+    - ``new_value``: new value (already converted to the stored unit, e.g. kg).
+      ``None`` means unchanged. Range-checked via ``validate_value``.
+    - ``new_effective_from``: new start date. ``None`` means unchanged.
+    - ``new_effective_to``: ``UNSET`` (default) means unchanged; ``None`` means
+      make the row open (effective_to = NULL); a date string sets a closed end.
+
+    Re-validates invariants against neighbouring rows (overlap, single-open,
+    positive duration), excluding the row being edited. Returns
+    ``{"before": {...}, "after": {...}}`` for an easy manual revert.
+    """
+    if field_name not in FIELD_NAMES:
+        raise ValidationError(
+            f"field_name must be one of {FIELD_NAMES}, got {field_name!r}"
+        )
+    cursor = await conn.execute(
+        """
+        SELECT id, value, effective_from, effective_to
+        FROM athlete_config_history
+        WHERE user_id = ? AND field_name = ? AND effective_from = ?
+        """,
+        (user_id, field_name, effective_from),
+    )
+    target = await cursor.fetchone()
+    if target is None:
+        raise ValidationError(
+            f"no {field_name} row with effective_from={effective_from} to edit. "
+            f"Check strava_get_athlete_config_history for the exact start date."
+        )
+    row_id, cur_value, cur_from, cur_to = target
+
+    value_final = cur_value if new_value is None else new_value
+    from_final = cur_from if new_effective_from is None else new_effective_from
+    to_final = cur_to if new_effective_to is UNSET else new_effective_to
+
+    if new_value is not None:
+        validate_value(field_name, value_final)
+
+    if to_final is not None and from_final >= to_final:
+        raise ValidationError(
+            f"{field_name}: effective_from ({from_final}) must be strictly "
+            f"before effective_to ({to_final})."
+        )
+
+    # Overlap check, excluding the row being edited.
+    to_bound = to_final if to_final is not None else _OPEN_UPPER_BOUND
+    cursor = await conn.execute(
+        """
+        SELECT effective_from, effective_to FROM athlete_config_history
+        WHERE user_id = ? AND field_name = ? AND id != ?
+          AND effective_from < ?
+          AND (effective_to IS NULL OR effective_to > ?)
+        LIMIT 1
+        """,
+        (user_id, field_name, row_id, to_bound, from_final),
+    )
+    overlap = await cursor.fetchone()
+    if overlap is not None:
+        existing_from, existing_to = overlap
+        existing_to_str = existing_to or "open"
+        to_str = to_final or "open"
+        raise ValidationError(
+            f"{field_name}: edited window [{from_final}, {to_str}) overlaps "
+            f"with existing row [{existing_from}, {existing_to_str})."
+        )
+
+    # Single-open check, excluding the row being edited.
+    if to_final is None:
+        cursor = await conn.execute(
+            """
+            SELECT effective_from FROM athlete_config_history
+            WHERE user_id = ? AND field_name = ? AND id != ?
+              AND effective_to IS NULL
+            LIMIT 1
+            """,
+            (user_id, field_name, row_id),
+        )
+        other_open = await cursor.fetchone()
+        if other_open is not None:
+            raise ValidationError(
+                f"{field_name}: another open row already starts on "
+                f"{other_open[0]}. Close it first — only one open row allowed."
+            )
+
+    await conn.execute(
+        """
+        UPDATE athlete_config_history
+        SET value = ?, effective_from = ?, effective_to = ?
+        WHERE id = ?
+        """,
+        (value_final, from_final, to_final, row_id),
+    )
+    await conn.commit()
+    return {
+        "before": {
+            "value": cur_value,
+            "effective_from": cur_from,
+            "effective_to": cur_to,
+        },
+        "after": {
+            "value": value_final,
+            "effective_from": from_final,
+            "effective_to": to_final,
+        },
     }
