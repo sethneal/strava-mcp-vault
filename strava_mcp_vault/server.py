@@ -1384,8 +1384,8 @@ async def edit_athlete_config_row(
     - new_unit: "kg" or "lb" — required only when editing a weight value.
     - new_effective_from: optional new start date (ISO).
     - new_effective_to: optional new end date (ISO). Pass the literal "open"
-      to clear the end date (make the row current/open). Omit to leave it
-      unchanged.
+      to clear the end date (make the row current/open). Omitting it or
+      passing null both leave the end date unchanged — only "open" clears it.
 
     Re-validates against neighbouring rows: no overlapping windows, at most
     one open row per field. Rejected edits leave the database untouched.
