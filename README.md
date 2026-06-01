@@ -76,6 +76,8 @@ For a simpler setup that just wraps the existing npm package in Docker, see [str
 | `strava_set_athlete_ftp_historical` / `_lthr_historical` / `_weight_historical` | Backfill a closed `[effective_from, effective_to)` window for historical periods that pre-date your use of this MCP. Must not overlap existing rows. | — |
 | `strava_get_athlete_config` | Resolve effective FTP / LTHR / weight as of a date (default today). Each field's value comes with the `effective_from` of the row that supplied it. | — |
 | `strava_get_athlete_config_history` | Full audit trail for one field (FTP, LTHR, or weight), newest first. | — |
+| `strava_edit_athlete_config_row` | Edit a config row's value and/or effective dates (fix a mistaken entry); re-validates overlap & single-open invariants. | — |
+| `strava_delete_athlete_config_row` | Delete a config row by (field_name, effective_from); may leave a gap. Returns the deleted values for easy re-add. | — |
 | `strava_compute_activity_load` | Compute TSS / NP / IF for one activity using Coggan power-TSS (with spec-compliant gap handling) or TrainingPeaks hrTSS as fallback. Returns the inputs used (with `effective_from` dates) so you can audit. | per-activity cache keyed by `(activity_id, inputs_hash)` |
 | `strava_compute_fitness_curve` | Daily CTL / ATL / TSB series for a date range. 180-day warmup by default for cold-start convergence. | per-activity cache hit on subsequent runs |
 | `strava_get_training_load_today` | Today's CTL / ATL / TSB plus an N-day rest forecast (default 7) showing where form lands if you do zero training. | — |

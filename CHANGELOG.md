@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`strava_edit_athlete_config_row` and `strava_delete_athlete_config_row`** — surgical edit/delete for manually-entered athlete config (FTP/LTHR/weight), preserving no-overlap and single-open-row invariants. Strava-imported activity data remains read-only.
 - **Power-meter data surfaced across read tools.** `strava_get_activity` now
   renders an ⚡ Power section with average, weighted-average ("NP"), max,
   total work (kJ), and source ("Power meter" vs. "Estimated"). Rides with
