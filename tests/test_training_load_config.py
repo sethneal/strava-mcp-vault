@@ -419,5 +419,6 @@ async def test_delete_missing_row_raises(conn):
 
 @pytest.mark.asyncio
 async def test_delete_unknown_field_raises(conn):
+    """An unrecognized field_name → ValidationError before any DB access."""
     with pytest.raises(config.ValidationError, match="field_name"):
         await config.delete_field_row(conn, USER_ID, "vo2max", "2024-01-01")
