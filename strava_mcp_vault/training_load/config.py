@@ -271,3 +271,46 @@ async def get_history(
         }
         for r in rows
     ]
+
+
+async def delete_field_row(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    field_name: FieldName,
+    effective_from: str,
+) -> dict[str, float | str | None]:
+    """Delete a single config row identified by (field_name, effective_from).
+
+    Returns the deleted row's values so the caller can re-add it via
+    ``set_field_historical`` if the deletion was a mistake. Deleting a row
+    may leave a gap in the timeline; that is allowed — the resolver returns
+    ``None`` for uncovered dates.
+    """
+    if field_name not in FIELD_NAMES:
+        raise ValidationError(
+            f"field_name must be one of {FIELD_NAMES}, got {field_name!r}"
+        )
+    cursor = await conn.execute(
+        """
+        SELECT id, value, effective_to FROM athlete_config_history
+        WHERE user_id = ? AND field_name = ? AND effective_from = ?
+        """,
+        (user_id, field_name, effective_from),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise ValidationError(
+            f"no {field_name} row with effective_from={effective_from} to delete. "
+            f"Check strava_get_athlete_config_history for the exact start date."
+        )
+    row_id, value, effective_to = row
+    await conn.execute(
+        "DELETE FROM athlete_config_history WHERE id = ?", (row_id,)
+    )
+    await conn.commit()
+    return {
+        "field_name": field_name,
+        "value": value,
+        "effective_from": effective_from,
+        "effective_to": effective_to,
+    }
