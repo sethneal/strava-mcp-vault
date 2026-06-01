@@ -352,6 +352,11 @@ async def edit_field_row(
     Re-validates invariants against neighbouring rows (overlap, single-open,
     positive duration), excluding the row being edited. Returns
     ``{"before": {...}, "after": {...}}`` for an easy manual revert.
+
+    Identity is the ``(user_id, field_name, effective_from)`` triple. This is
+    unique in practice because the write path rejects overlaps (two rows for
+    one field can't share a start date without overlapping), so the lookup's
+    ``fetchone()`` is unambiguous.
     """
     if field_name not in FIELD_NAMES:
         raise ValidationError(

@@ -551,6 +551,39 @@ async def test_edit_multi_user_isolation(conn):
     assert (await config.get_config_at(conn, 2, "2024-06-01"))["ftp_watts"] == 300
 
 
+@pytest.mark.asyncio
+async def test_edit_shift_effective_from_into_neighbor_raises(conn):
+    """Overlap via the start date: shifting effective_from back into an
+    earlier window → ValidationError (the overlap-via-from path)."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2024-06-01"
+    )
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 260, "2024-07-01", "2024-12-01"
+    )
+    # Move the second window's start back into the first window.
+    with pytest.raises(config.ValidationError, match="overlap"):
+        await config.edit_field_row(
+            conn, USER_ID, "ftp_watts", "2024-07-01",
+            new_effective_from="2024-05-01",
+        )
+
+
+@pytest.mark.asyncio
+async def test_edit_to_open_overlapping_open_row_raises(conn):
+    """Opening a closed row whose window also overlaps an existing open row →
+    rejected by the overlap check before the single-open check runs."""
+    await config.set_field_historical(
+        conn, USER_ID, "ftp_watts", 240, "2024-01-01", "2024-06-01"
+    )
+    await config.set_field(conn, USER_ID, "ftp_watts", 260, "2025-01-01")
+    # Open the earlier closed row → [2024-01-01, ∞) overlaps the open row.
+    with pytest.raises(config.ValidationError, match="overlap"):
+        await config.edit_field_row(
+            conn, USER_ID, "ftp_watts", "2024-01-01", new_effective_to=None
+        )
+
+
 # ── Acceptance fixture: the real weight_kg bug ───────────────────────────
 
 
