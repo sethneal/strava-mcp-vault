@@ -549,3 +549,57 @@ async def test_edit_multi_user_isolation(conn):
     await config.set_field(conn, 2, "ftp_watts", 300, "2024-01-01")
     await config.edit_field_row(conn, USER_ID, "ftp_watts", "2024-01-01", new_value=250)
     assert (await config.get_config_at(conn, 2, "2024-06-01"))["ftp_watts"] == 300
+
+
+# ── Acceptance fixture: the real weight_kg bug ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_acceptance_fix_stray_weight_row(conn):
+    """Reproduce and fix the real bug: a stray weight row left a 6-day
+    fragment that no tool could touch. After delete + extend-neighbour the
+    timeline is gapless, non-overlapping, with a single open row.
+
+    Seed (kg):
+      138.8  [2020-01-01, 2024-01-01)   (306 lb window)
+      111.13 [2024-01-01, 2024-01-07)   (stray, the bug)
+      125.2  [2024-01-07, open)         (276 lb, current)
+    """
+    await config.set_field_historical(
+        conn, USER_ID, "weight_kg", 138.8, "2020-01-01", "2024-01-01"
+    )
+    await config.set_field_historical(
+        conn, USER_ID, "weight_kg", 111.13, "2024-01-01", "2024-01-07"
+    )
+    await config.set_field(conn, USER_ID, "weight_kg", 125.2, "2024-01-07")
+
+    # 1. Delete the stray row → opens gap [2024-01-01, 2024-01-07).
+    deleted = await config.delete_field_row(
+        conn, USER_ID, "weight_kg", "2024-01-01"
+    )
+    assert deleted["value"] == 111.13
+    assert (await config.get_config_at(conn, USER_ID, "2024-01-03"))[
+        "weight_kg"
+    ] is None  # gap exists before stitching
+
+    # 2. Extend the 306-lb window over the gap.
+    await config.edit_field_row(
+        conn, USER_ID, "weight_kg", "2020-01-01", new_effective_to="2024-01-07"
+    )
+
+    # 3. Assert clean timeline.
+    hist = await config.get_history(conn, USER_ID, "weight_kg")
+    assert len(hist) == 2  # stray gone
+    open_rows = [r for r in hist if r["effective_to"] is None]
+    assert len(open_rows) == 1  # exactly one open row
+    assert open_rows[0]["value"] == 125.2
+    # gapless coverage across the whole span
+    assert (await config.get_config_at(conn, USER_ID, "2024-01-03"))[
+        "weight_kg"
+    ] == 138.8
+    assert (await config.get_config_at(conn, USER_ID, "2024-01-07"))[
+        "weight_kg"
+    ] == 125.2
+    assert (await config.get_config_at(conn, USER_ID, "2026-06-01"))[
+        "weight_kg"
+    ] == 125.2
