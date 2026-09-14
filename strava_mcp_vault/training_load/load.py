@@ -165,7 +165,12 @@ async def compute_activity_load(
     ``(activity_id, inputs_hash)`` so the same activity can have multiple
     cached rows reflecting different FTP/LTHR snapshots over time.
     """
-    activity = await manager.get_activity(activity_id)
+    # Prefer permanent vault storage. Activity detail is immutable, but the
+    # cache TTL for it is 24h, so walking a 180-day window through
+    # manager.get_activity refetched every activity from Strava every day.
+    activity = await manager.db.get_vault_activity(activity_id)
+    if activity is None:
+        activity = await manager.get_activity(activity_id)
 
     start_local = activity.get("start_date_local") or activity.get("start_date") or ""
     date = start_local[:10]

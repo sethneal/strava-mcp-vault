@@ -10,7 +10,16 @@ class VaultError(Exception):
 
 
 class RateLimitError(VaultError):
-    """Strava API rate limit exceeded."""
+    """Strava API rate limit exceeded.
+
+    `retry_after` is the number of seconds until the 15-minute window
+    resets, so callers can decide whether to wait or give up rather than
+    guessing.
+    """
+
+    def __init__(self, message: str, retry_after: int | None = None):
+        self.retry_after = retry_after
+        super().__init__(message)
 
 
 class StravaAPIError(VaultError):

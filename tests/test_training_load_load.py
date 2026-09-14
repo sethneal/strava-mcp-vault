@@ -31,6 +31,8 @@ def _make_manager(activity: dict, streams: dict | None = None):
     NoMatchingStreamsError, simulating "scalar present but stream absent"."""
     m = AsyncMock()
     m.get_activity = AsyncMock(return_value=activity)
+    # Default to "not in the vault" so these cases exercise the API path.
+    m.db.get_vault_activity = AsyncMock(return_value=None)
     if streams is None:
         m.get_streams_normalized = AsyncMock(
             side_effect=NoMatchingStreamsError(
@@ -294,3 +296,52 @@ async def test_activity_missing_date_returns_none_with_warning(conn):
 
     assert result["method"] == "none"
     assert any("start_date" in w for w in result["warnings"])
+
+
+# ── Vault reads instead of API refetches ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_vault_activity_is_not_refetched_from_the_api(conn):
+    """Activity detail is immutable, and the vault already stores it forever.
+
+    Going through the TTL'd cache meant the 24h activity_detail entry was
+    cold every morning, so the fitness curve refetched every activity in its
+    180-day window — hundreds of reads a day against a 100-per-15-minute
+    budget.
+    """
+    await tl_config.set_field(conn, USER_ID, "ftp_watts", 250, "2025-01-01")
+    activity = {
+        "id": ACTIVITY_ID,
+        "start_date_local": "2026-05-15T08:00:00Z",
+        "moving_time": 3600,
+        "average_watts": 240,
+        "has_heartrate": False,
+    }
+    manager = _make_manager(activity, streams={"watts": [250] * 3600})
+    manager.db.get_vault_activity = AsyncMock(return_value=activity)
+
+    result = await load.compute_activity_load(conn, manager, ACTIVITY_ID, USER_ID)
+
+    assert result["method"] == "power"
+    manager.db.get_vault_activity.assert_awaited_once_with(ACTIVITY_ID)
+    manager.get_activity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_api_when_activity_absent_from_vault(conn):
+    await tl_config.set_field(conn, USER_ID, "ftp_watts", 250, "2025-01-01")
+    activity = {
+        "id": ACTIVITY_ID,
+        "start_date_local": "2026-05-15T08:00:00Z",
+        "moving_time": 3600,
+        "average_watts": 240,
+        "has_heartrate": False,
+    }
+    manager = _make_manager(activity, streams={"watts": [250] * 3600})
+    manager.db.get_vault_activity = AsyncMock(return_value=None)
+
+    result = await load.compute_activity_load(conn, manager, ACTIVITY_ID, USER_ID)
+
+    assert result["method"] == "power"
+    manager.get_activity.assert_awaited_once_with(ACTIVITY_ID)
