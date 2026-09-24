@@ -126,6 +126,7 @@ async def test_token_refresh_on_expiry(client, mock_cache_db):
 
 @respx.mock
 async def test_rate_limit_error(client):
+    client.max_rate_limit_wait = 0  # don't block the test waiting for a reset
     respx.get("https://www.strava.com/api/v3/athlete").mock(
         return_value=httpx.Response(
             429,
@@ -157,6 +158,119 @@ async def test_rate_limit_tracking(client):
     assert rl is not None
     assert rl["short"]["usage"] == 10
     assert rl["long"]["limit"] == 1000
+
+
+# ── Read rate limits ───────────────────────────────────────────────────
+#
+# Strava enforces a second, stricter budget on read requests (100/15min,
+# 1000/day) alongside the overall one (200/15min, 2000/day). Tracking only
+# X-RateLimit-* makes the client believe it has headroom while Strava is
+# already refusing — the bug that produced daily 429s.
+
+
+@respx.mock
+async def test_read_rate_limit_headers_are_tracked(client):
+    respx.get("https://www.strava.com/api/v3/athlete").mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": 1},
+            headers={
+                "X-RateLimit-Usage": "103,207",
+                "X-RateLimit-Limit": "200,2000",
+                "X-ReadRateLimit-Usage": "103,207",
+                "X-ReadRateLimit-Limit": "100,1000",
+            },
+        )
+    )
+    await client.get_athlete()
+    read = client.read_rate_limit_remaining
+    assert read is not None
+    assert read["short"]["usage"] == 103
+    assert read["short"]["limit"] == 100
+    assert read["long"]["limit"] == 1000
+
+
+@respx.mock
+async def test_rate_limit_remaining_reports_the_binding_limit(client):
+    """103/200 overall looks fine; 103/100 read is the limit actually hit."""
+    respx.get("https://www.strava.com/api/v3/athlete").mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": 1},
+            headers={
+                "X-RateLimit-Usage": "103,207",
+                "X-RateLimit-Limit": "200,2000",
+                "X-ReadRateLimit-Usage": "103,207",
+                "X-ReadRateLimit-Limit": "100,1000",
+            },
+        )
+    )
+    await client.get_athlete()
+    rl = client.rate_limit_remaining
+    assert rl["short"]["limit"] == 100, "should report the stricter read limit"
+    assert rl["long"]["limit"] == 1000
+
+
+@respx.mock
+async def test_429_message_names_the_read_limit(client):
+    client.max_rate_limit_wait = 0
+    respx.get("https://www.strava.com/api/v3/athlete").mock(
+        return_value=httpx.Response(
+            429,
+            headers={
+                "X-RateLimit-Usage": "103,207",
+                "X-RateLimit-Limit": "200,2000",
+                "X-ReadRateLimit-Usage": "103,207",
+                "X-ReadRateLimit-Limit": "100,1000",
+            },
+        )
+    )
+    with pytest.raises(RateLimitError) as exc_info:
+        await client.get_athlete()
+    msg = str(exc_info.value)
+    assert "103/100" in msg, f"should name the read budget actually hit, got: {msg}"
+
+
+# ── Pre-flight budget guard ────────────────────────────────────────────
+
+
+@respx.mock
+async def test_exhausted_read_budget_stops_before_spending_a_request(client, monkeypatch):
+    """The burst must stop cleanly rather than spray 429s.
+
+    A 429 returns no data, so nothing gets cached and the same activity is
+    refetched the next run — the loop that made this recur daily.
+    """
+    monkeypatch.setattr(client, "_seconds_until_window_reset", lambda: 300)
+    client.max_rate_limit_wait = 0
+    client._read_rate_limit_usage = "100,500"
+    client._read_rate_limit_limit = "100,1000"
+
+    route = respx.get("https://www.strava.com/api/v3/athlete").mock(
+        return_value=httpx.Response(200, json={"id": 1})
+    )
+    with pytest.raises(RateLimitError) as exc_info:
+        await client.get_athlete()
+
+    assert route.call_count == 0, "must not spend a request it cannot afford"
+    assert exc_info.value.retry_after == 300
+
+
+@respx.mock
+async def test_budget_guard_allows_request_with_headroom(client):
+    client._read_rate_limit_usage = "42,500"
+    client._read_rate_limit_limit = "100,1000"
+    route = respx.get("https://www.strava.com/api/v3/athlete").mock(
+        return_value=httpx.Response(200, json={"id": 1})
+    )
+    await client.get_athlete()
+    assert route.call_count == 1
+
+
+async def test_window_reset_aligns_to_quarter_hour(client):
+    """Strava's 15-minute windows reset on the clock quarter hour."""
+    reset = client._seconds_until_window_reset()
+    assert 0 < reset <= 900
 
 
 # ── Retry on transient errors ─────────────────────────────────────────

@@ -409,6 +409,20 @@ class CacheDB:
         rows = await cursor.fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    async def get_vault_activity(self, activity_id: int) -> dict | None:
+        """Return one activity from permanent vault storage, or None.
+
+        Vault rows never expire, so callers that only need immutable detail
+        (start date, duration, HR/power scalars) can read here instead of
+        going through the 24h TTL cache and refetching from Strava.
+        """
+        cursor = await self._db.execute(
+            "SELECT data FROM activities WHERE id = ?",
+            (activity_id,),
+        )
+        row = await cursor.fetchone()
+        return json.loads(row[0]) if row else None
+
     async def get_vault_activity_count(
         self,
         sport_type: str | None = None,

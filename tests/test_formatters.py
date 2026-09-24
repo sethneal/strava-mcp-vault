@@ -403,6 +403,22 @@ def test_format_cache_stats():
     assert "Hit Rate" in result
 
 
+def test_format_cache_stats_absent_key_row_has_no_hit_rate():
+    # Absent keys land in the "unknown" bucket and can never hit, so a 0%
+    # hit rate there is an artifact, not a cache failure.
+    stats = {
+        "vault": {"total_activities": 0, "date_range": None, "sync_log": None},
+        "total_cached_items": 0,
+        "db_size_bytes": 0,
+        "categories": {"unknown": {"hits": 0, "misses": 7294}},
+        "rate_limit": None,
+    }
+    result = format_cache_stats(stats)
+    assert "| (not cached yet) | 0 | 7294 | — |" in result
+    assert "| unknown |" not in result
+    assert "0%" not in result
+
+
 def test_format_cache_stats_no_sync():
     stats = {
         "vault": {"total_activities": 0, "date_range": None, "sync_log": None},

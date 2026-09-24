@@ -946,6 +946,9 @@ def format_cache_stats(stats: dict) -> str:
             misses = data.get("misses", 0)
             total_req = hits + misses
             rate = f"{(hits / total_req * 100):.0f}%" if total_req > 0 else "N/A"
+            # "unknown" counts lookups for keys never cached; they can't hit.
+            if cat == "unknown":
+                cat, rate = "(not cached yet)", "—"
             lines.append(f"| {cat} | {hits} | {misses} | {rate} |")
         lines.append("")
 
